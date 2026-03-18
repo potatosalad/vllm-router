@@ -789,7 +789,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(trace_config) = &config.trace_config {
         if let Err(e) = otel_trace::otel_tracing_init(
             trace_config.enable_trace,
-            Some(&trace_config.otlp_traces_endpoint),
+            trace_config.otlp_traces_endpoint.as_deref(),
         ) {
             eprintln!("Failed to initialize OpenTelemetry: {e}");
         }

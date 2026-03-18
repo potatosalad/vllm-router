@@ -211,9 +211,9 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Tracing (OpenTelemetry)")]
     enable_trace: bool,
 
-    /// OTLP collector endpoint (format: host:port)
-    #[arg(long, default_value = "localhost:4317", help_heading = "Tracing (OpenTelemetry)")]
-    otlp_traces_endpoint: String,
+    /// OTLP collector endpoint (format: host:port). If omitted, respects OTEL_EXPORTER_OTLP_ENDPOINT.
+    #[arg(long, help_heading = "Tracing (OpenTelemetry)")]
+    otlp_traces_endpoint: Option<String>,
 
     /// Enable Kubernetes service discovery
     #[arg(long, default_value_t = false)]
@@ -691,6 +691,7 @@ impl CliArgs {
             } else {
                 None
             },
+
         }
     }
 }

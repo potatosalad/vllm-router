@@ -78,27 +78,30 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         return Ok(());
     }
 
-    let endpoint = otlp_endpoint.unwrap_or("localhost:4317");
-    let endpoint = if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-        format!("http://{endpoint}")
-    } else {
-        endpoint.to_string()
-    };
-
     global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
         Box::new(TraceContextPropagator::new()),
         Box::new(BaggagePropagator::new()),
     ]));
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(&endpoint)
-        .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-        .build()
-        .map_err(|e| {
-            eprintln!("[tracing] Failed to create OTLP exporter: {e}");
-            anyhow::anyhow!("Failed to create OTLP exporter: {e}")
-        })?;
+        .with_protocol(opentelemetry_otlp::Protocol::Grpc);
+
+    // Only set the endpoint explicitly when configured; otherwise the SDK
+    // respects OTEL_EXPORTER_OTLP_ENDPOINT (defaulting to localhost:4317).
+    if let Some(ep) = otlp_endpoint {
+        let ep = if !ep.starts_with("http://") && !ep.starts_with("https://") {
+            format!("http://{ep}")
+        } else {
+            ep.to_string()
+        };
+        exporter_builder = exporter_builder.with_endpoint(&ep);
+    }
+
+    let exporter = exporter_builder.build().map_err(|e| {
+        eprintln!("[tracing] Failed to create OTLP exporter: {e}");
+        anyhow::anyhow!("Failed to create OTLP exporter: {e}")
+    })?;
 
     let batch_config = BatchConfigBuilder::default()
         .with_scheduled_delay(Duration::from_millis(500))
