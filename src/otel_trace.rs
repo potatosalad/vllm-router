@@ -131,9 +131,7 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
 
     let _ = global::set_tracer_provider(provider);
 
-    ENABLED.store(true, Ordering::Release);
-
-    eprintln!("[tracing] OpenTelemetry initialized successfully");
+    eprintln!("[tracing] OpenTelemetry SDK initialized, awaiting subscriber installation");
     Ok(())
 }
 
@@ -142,10 +140,6 @@ pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>>
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
-    if !is_otel_enabled() {
-        anyhow::bail!("OpenTelemetry is not enabled");
-    }
-
     let tracer = TRACER
         .get()
         .ok_or_else(|| anyhow::anyhow!("Tracer not initialized. Call otel_tracing_init first."))?
@@ -156,6 +150,15 @@ where
         .with_filter(CustomOtelFilter::new());
 
     Ok(Box::new(layer))
+}
+
+/// Mark OpenTelemetry tracing as enabled.
+///
+/// Must only be called after both the OTel SDK and the tracing subscriber
+/// (with the OTel layer) have been successfully installed.
+pub fn mark_otel_enabled() {
+    ENABLED.store(true, Ordering::Release);
+    eprintln!("[tracing] OpenTelemetry tracing enabled");
 }
 
 /// Check if OpenTelemetry tracing is enabled.

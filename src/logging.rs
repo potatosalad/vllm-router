@@ -168,11 +168,13 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         layers.push(file_layer);
     }
 
+    let mut otel_layer_added = false;
     if let Some(otel_layer_config) = &otel_layer_config {
         if otel_layer_config.enable_trace {
             match get_otel_layer() {
                 Ok(otel_layer) => {
                     layers.push(otel_layer);
+                    otel_layer_added = true;
                 }
                 Err(e) => {
                     eprintln!("Failed to initialize OpenTelemetry layer: {e}");
@@ -183,10 +185,16 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     // Initialize the subscriber with all layers
     // Use try_init to handle errors gracefully in case another subscriber is already set
-    let _ = tracing_subscriber::registry()
+    let subscriber_installed = tracing_subscriber::registry()
         .with(env_filter)
         .with(layers)
-        .try_init();
+        .try_init()
+        .is_ok();
+
+    // Only report OTel as enabled after both the layer and subscriber are live
+    if otel_layer_added && subscriber_installed {
+        crate::otel_trace::mark_otel_enabled();
+    }
 
     // Return the guard to keep the file appender worker thread alive
     LogGuard {
