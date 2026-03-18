@@ -9,7 +9,8 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
-use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
+use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -244,6 +245,41 @@ impl<B> OnResponse<B> for ResponseLogger {
     }
 }
 
+/// Custom on_failure handler for pre-response errors (e.g. connection drops).
+#[derive(Clone, Debug, Default)]
+pub struct FailureLogger;
+
+impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
+    fn on_failure(
+        &mut self,
+        failure: ServerErrorsFailureClass,
+        latency: std::time::Duration,
+        span: &Span,
+    ) {
+        let message = match &failure {
+            ServerErrorsFailureClass::StatusCode(code) => {
+                format!("response failed with status {code}")
+            }
+            ServerErrorsFailureClass::Error(err) => {
+                format!("request failed: {err}")
+            }
+        };
+
+        span.record("latency", format!("{:?}", latency));
+        span.record("error", &message);
+
+        if crate::otel_trace::is_otel_enabled() {
+            span.set_status(opentelemetry::trace::Status::error(message.clone()));
+        }
+
+        let _enter = span.enter();
+        error!(
+            target: "vllm_router_rs::response",
+            "{message}"
+        );
+    }
+}
+
 /// Create a configured TraceLayer for HTTP logging
 /// Note: Actual request/response logging with request IDs is done in RequestIdService
 pub fn create_logging_layer() -> TraceLayer<
@@ -251,11 +287,17 @@ pub fn create_logging_layer() -> TraceLayer<
     RequestSpan,
     RequestLogger,
     ResponseLogger,
+    (),
+    (),
+    FailureLogger,
 > {
     TraceLayer::new_for_http()
         .make_span_with(RequestSpan)
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
+        .on_body_chunk(())
+        .on_eos(())
+        .on_failure(FailureLogger)
 }
 
 /// Structured logging data for requests
