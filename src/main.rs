@@ -806,11 +806,15 @@ Provide --worker-urls or PD flags as usual.",
 
     // Block on the async startup function
     println!("DEBUG: Starting server startup function");
-    runtime.block_on(async move { server::startup(server_config).await })?;
-
-    if vllm_router_rs::otel_trace::is_otel_enabled() {
-        vllm_router_rs::otel_trace::shutdown_otel();
-    }
+    runtime.block_on(async move {
+        let result = server::startup(server_config).await;
+        // Shut down OTel while the Tokio runtime is still alive so the
+        // BatchSpanProcessor can flush its final batch.
+        if vllm_router_rs::otel_trace::is_otel_enabled() {
+            vllm_router_rs::otel_trace::shutdown_otel();
+        }
+        result
+    })?;
 
     Ok(())
 }
