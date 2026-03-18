@@ -95,6 +95,22 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         EnvFilter::new(filter_string)
     });
 
+    // When OTel tracing is enabled, ensure the OTel span target passes through
+    // the global EnvFilter regardless of log level. Without this, --log-level warn
+    // silently suppresses all info-level OTel spans.
+    let env_filter = if otel_layer_config
+        .as_ref()
+        .map_or(false, |c| c.enable_trace)
+    {
+        env_filter.add_directive(
+            "vllm_router_rs::otel-trace=trace"
+                .parse()
+                .expect("valid EnvFilter directive"),
+        )
+    } else {
+        env_filter
+    };
+
     // Setup stdout/stderr layer
     let mut layers = Vec::new();
 
