@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 /// vLLM PD Router that extends PDRouter with vLLM-specific request handling
@@ -422,9 +422,16 @@ impl VllmPDRouter {
             );
         }
 
+        let prefill_span = info_span!(
+            target: "vllm_router_rs::otel-trace",
+            "pd_backend_request",
+            vllm.request_phase = "prefill",
+            peer.address = %prefill_base_http,
+        );
         let prefill_response = match prefill_request_builder
             .body(prefill_request_str)
             .send()
+            .instrument(prefill_span)
             .await
         {
             Ok(resp) => resp,
@@ -534,7 +541,13 @@ impl VllmPDRouter {
             );
         }
 
-        let decode_response = match decode_request_builder.body(decode_request_str).send().await {
+        let decode_span = info_span!(
+            target: "vllm_router_rs::otel-trace",
+            "pd_backend_request",
+            vllm.request_phase = "decode",
+            peer.address = %decode_base_http,
+        );
+        let decode_response = match decode_request_builder.body(decode_request_str).send().instrument(decode_span).await {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);

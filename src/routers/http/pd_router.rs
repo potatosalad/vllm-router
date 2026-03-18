@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct PDRouter {
@@ -1008,6 +1008,12 @@ impl PDRouter {
         };
 
         // Build decode request with shared client
+        let decode_span = info_span!(
+            target: "vllm_router_rs::otel-trace",
+            "pd_backend_request",
+            vllm.request_phase = "decode",
+            peer.address = %decode.url(),
+        );
         let decode_request = self.build_post_with_headers(
             &self.client,
             decode.url(),
@@ -1026,6 +1032,12 @@ impl PDRouter {
 
         if context.return_logprob {
             // Build prefill request with shared client when we need response body
+            let prefill_span = info_span!(
+                target: "vllm_router_rs::otel-trace",
+                "pd_backend_request",
+                vllm.request_phase = "prefill",
+                peer.address = %prefill.url(),
+            );
             let prefill_request = self.build_post_with_headers(
                 &self.client,
                 prefill.url(),
@@ -1036,7 +1048,10 @@ impl PDRouter {
             );
             // When we need logprobs, wait for both responses
             let (prefill_result, decode_result) =
-                tokio::join!(prefill_request.send(), decode_request.send());
+                tokio::join!(
+                    prefill_request.send().instrument(prefill_span),
+                    decode_request.send().instrument(decode_span),
+                );
             debug!("Received responses from both servers");
 
             // Update metrics
@@ -1131,6 +1146,12 @@ impl PDRouter {
             // When we don't need logprobs, only wait for decode response
             // Send both requests concurrently but don't wait for prefill
             // Use dedicated prefill client with Connection: close
+            let prefill_span = info_span!(
+                target: "vllm_router_rs::otel-trace",
+                "pd_backend_request",
+                vllm.request_phase = "prefill",
+                peer.address = %prefill.url(),
+            );
             let prefill_future = self
                 .build_post_with_headers(
                     &self.prefill_client,
@@ -1140,8 +1161,9 @@ impl PDRouter {
                     headers,
                     true,
                 )
-                .send();
-            let decode_future = decode_request.send();
+                .send()
+                .instrument(prefill_span);
+            let decode_future = decode_request.send().instrument(decode_span);
 
             // Send prefill response to background worker for draining
             // This ensures HTTP compliance without blocking
