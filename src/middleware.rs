@@ -161,7 +161,6 @@ impl<B> MakeSpan<B> for RequestSpan {
             "http_request",
             otel.kind = "server",
             otel.name = %otel_name,
-            otel.status_code = Empty,
             http.request.method = %request.method(),
             http.route = Empty,
             url.path = %request.uri().path(),
@@ -233,9 +232,11 @@ impl<B> OnResponse<B> for ResponseLogger {
         span.record("http.response.status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
 
-        // Set OTel span status for server errors
-        if status.is_server_error() {
-            span.record("otel.status_code", "ERROR");
+        // Set OTel span status for server errors using the proper API
+        if status.is_server_error() && crate::otel_trace::is_otel_enabled() {
+            span.set_status(opentelemetry::trace::Status::error(format!(
+                "HTTP {}", status.as_u16()
+            )));
         }
 
         // Log the response completion
