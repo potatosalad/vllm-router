@@ -10,10 +10,10 @@ use std::{
 
 use anyhow::Result;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
+use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
-    propagation::TraceContextPropagator,
+    propagation::{BaggagePropagator, TraceContextPropagator},
     runtime,
     trace::{BatchConfigBuilder, BatchSpanProcessor, Tracer as SdkTracer, TracerProvider},
     Resource,
@@ -85,7 +85,10 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         endpoint.to_string()
     };
 
-    global::set_text_map_propagator(TraceContextPropagator::new());
+    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]));
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
