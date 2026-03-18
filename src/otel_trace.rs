@@ -98,6 +98,17 @@ impl PreparedOtel {
     }
 }
 
+/// Cross-platform hostname with PID for unique instance identification.
+fn service_instance_id() -> String {
+    let hostname = ["HOSTNAME", "HOST", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()));
+    match hostname {
+        Some(hostname) => format!("{hostname}-{}", std::process::id()),
+        None => format!("pid-{}", std::process::id()),
+    }
+}
+
 /// Build OTel provider and tracer without mutating global state.
 pub fn prepare_otel(otlp_endpoint: Option<&str>) -> Result<PreparedOtel> {
     let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
@@ -128,13 +139,11 @@ pub fn prepare_otel(otlp_endpoint: Option<&str>) -> Result<PreparedOtel> {
         .with_batch_config(batch_config)
         .build();
 
-    let mut resource_attrs = vec![
+    let resource_attrs = vec![
         KeyValue::new("service.name", "vllm-router"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.instance.id", service_instance_id()),
     ];
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        resource_attrs.push(KeyValue::new("service.instance.id", hostname));
-    }
     let resource = Resource::default().merge(&Resource::new(resource_attrs));
 
     let provider = TracerProvider::builder()
