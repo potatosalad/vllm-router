@@ -13,8 +13,9 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpListener;
 
 /// Mock OpenAI API server for testing
@@ -27,6 +28,7 @@ pub struct MockOpenAIServer {
 struct MockServerState {
     require_auth: bool,
     expected_auth: Option<String>,
+    port: u16,
 }
 
 impl MockOpenAIServer {
@@ -43,6 +45,7 @@ impl MockOpenAIServer {
         let state = Arc::new(MockServerState {
             require_auth: expected_auth.is_some(),
             expected_auth,
+            port: addr.port(),
         });
 
         let app = Router::new()
@@ -68,10 +71,62 @@ impl MockOpenAIServer {
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
     }
+
+    pub fn clear_captured_requests(&self) {
+        clear_captured_requests(self.addr.port());
+    }
+
+    pub fn captured_requests(&self) -> Vec<CapturedRequest> {
+        get_captured_requests(self.addr.port())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CapturedRequest {
+    pub path: String,
+    pub headers: HashMap<String, String>,
+}
+
+static REQ_CAPTURE_STORE: OnceLock<Mutex<HashMap<u16, Vec<CapturedRequest>>>> = OnceLock::new();
+
+fn get_capture_store() -> &'static Mutex<HashMap<u16, Vec<CapturedRequest>>> {
+    REQ_CAPTURE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn capture_request(port: u16, path: &str, headers: &axum::http::HeaderMap) {
+    let captured = CapturedRequest {
+        path: path.to_string(),
+        headers: headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect(),
+    };
+
+    let mut store = get_capture_store().lock().unwrap();
+    store.entry(port).or_default().push(captured);
+}
+
+fn clear_captured_requests(port: u16) {
+    let mut store = get_capture_store().lock().unwrap();
+    store.remove(&port);
+}
+
+fn get_captured_requests(port: u16) -> Vec<CapturedRequest> {
+    let store = get_capture_store().lock().unwrap();
+    store.get(&port).cloned().unwrap_or_default()
 }
 
 /// Mock chat completions endpoint
-async fn mock_chat_completions(req: Request<Body>) -> Response {
+async fn mock_chat_completions(
+    State(state): State<Arc<MockServerState>>,
+    req: Request<Body>,
+) -> Response {
+    capture_request(state.port, req.uri().path(), req.headers());
     let (_, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
@@ -148,7 +203,11 @@ async fn mock_chat_completions(req: Request<Body>) -> Response {
 }
 
 /// Mock completions endpoint (legacy)
-async fn mock_completions(req: Request<Body>) -> Response {
+async fn mock_completions(
+    State(state): State<Arc<MockServerState>>,
+    req: Request<Body>,
+) -> Response {
+    capture_request(state.port, req.uri().path(), req.headers());
     let (_, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
@@ -185,6 +244,8 @@ async fn mock_completions(req: Request<Body>) -> Response {
 
 /// Mock models endpoint
 async fn mock_models(State(state): State<Arc<MockServerState>>, req: Request<Body>) -> Response {
+    capture_request(state.port, req.uri().path(), req.headers());
+
     // Optionally enforce Authorization header
     if state.require_auth {
         let auth = req

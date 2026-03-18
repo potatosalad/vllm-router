@@ -2400,16 +2400,24 @@ impl RouterTrait for PDRouter {
         // Add X-data-parallel-rank header for DP-aware routing
         request_builder = dp_utils::add_dp_rank_header(request_builder, decode_worker.dp_rank());
 
-        // Propagate headers
-        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-
         // Add JSON body if not null
         if !body.is_null() {
             request_builder = request_builder.json(&body);
         }
 
         // Send request
-        match request_builder.send().await {
+        match otel_http::send_client_request(
+            request_builder,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &url,
+                route: Some(path),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

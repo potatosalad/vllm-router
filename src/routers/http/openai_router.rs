@@ -2,6 +2,7 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, RerankRequest,
 };
@@ -135,7 +136,8 @@ impl super::super::RouterTrait for OpenAIRouter {
         // Proxy to upstream /v1/models; forward Authorization header if provided
         let headers = req.headers();
 
-        let mut upstream = self.client.get(format!("{}/v1/models", self.base_url));
+        let url = format!("{}/v1/models", self.base_url);
+        let mut upstream = self.client.get(&url);
 
         if let Some(auth) = headers
             .get("authorization")
@@ -144,7 +146,18 @@ impl super::super::RouterTrait for OpenAIRouter {
             upstream = upstream.header("Authorization", auth);
         }
 
-        match upstream.send().await {
+        match otel_http::send_client_request(
+            upstream,
+            Some(headers),
+            ClientRequestOptions {
+                method: "GET",
+                url: &url,
+                route: Some("/v1/models"),
+                request_phase: None,
+            },
+        )
+        .await
+        {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -256,7 +269,18 @@ impl super::super::RouterTrait for OpenAIRouter {
             req = req.header("Accept", "text/event-stream");
         }
 
-        let resp = match req.send().await {
+        let resp = match otel_http::send_client_request(
+            req,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &url,
+                route: Some("/v1/chat/completions"),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 self.circuit_breaker.record_failure();

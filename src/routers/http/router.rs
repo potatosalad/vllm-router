@@ -423,19 +423,36 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
+        let incoming_headers = req.headers();
         let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
             Ok(worker_url) => {
-                let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
+                let url = format!("{}/{}", worker_url, endpoint);
+                let route_name = format!("/{}", endpoint);
+                let mut request_builder = self.client.get(&url);
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
+                    if name_lc != "content-type"
+                        && name_lc != "content-length"
+                        && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
+                    {
                         request_builder = request_builder.header(name, value);
                     }
                 }
 
-                match request_builder.send().await {
+                match otel_http::send_client_request(
+                    request_builder,
+                    Some(incoming_headers),
+                    ClientRequestOptions {
+                        method: "GET",
+                        url: &url,
+                        route: Some(&route_name),
+                        request_phase: None,
+                    },
+                )
+                .await
+                {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -651,9 +668,11 @@ impl Router {
             let base = self.worker_base_url(&worker_url);
 
             let url = format!("{}/{}", base, endpoint);
-            let mut request_builder = match method {
-                Method::GET => self.client.get(url),
-                Method::POST => self.client.post(url),
+            let route_name = format!("/{}", endpoint);
+            let method_name = method.as_str().to_string();
+            let mut request_builder = match method.clone() {
+                Method::GET => self.client.get(&url),
+                Method::POST => self.client.post(&url),
                 _ => {
                     return (
                         StatusCode::METHOD_NOT_ALLOWED,
@@ -666,13 +685,27 @@ impl Router {
             if let Some(hdrs) = headers {
                 for (name, value) in hdrs {
                     let name_lc = name.as_str().to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
+                    if name_lc != "content-type"
+                        && name_lc != "content-length"
+                        && !header_utils::TRACE_HEADER_NAMES.contains(&name_lc.as_str())
+                    {
                         request_builder = request_builder.header(name, value);
                     }
                 }
             }
 
-            match request_builder.send().await {
+            match otel_http::send_client_request(
+                request_builder,
+                headers,
+                ClientRequestOptions {
+                    method: &method_name,
+                    url: &url,
+                    route: Some(&route_name),
+                    request_phase: None,
+                },
+            )
+            .await
+            {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1675,9 +1708,6 @@ impl RouterTrait for Router {
         // Add X-data-parallel-rank header for DP-aware routing
         request_builder = dp_utils::add_dp_rank_header(request_builder, worker.dp_rank());
 
-        // Propagate headers
-        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-
         // Add JSON body if not null/empty
         if !body.is_null() {
             request_builder = request_builder.json(&body);
@@ -1689,7 +1719,18 @@ impl RouterTrait for Router {
         }
 
         // Send request
-        match request_builder.send().await {
+        match otel_http::send_client_request(
+            request_builder,
+            headers,
+            ClientRequestOptions {
+                method: method.as_str(),
+                url: &url,
+                route: Some(path),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(response) => {
                 let status = response.status();
                 let headers = response.headers().clone();
