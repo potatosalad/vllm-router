@@ -1681,6 +1681,10 @@ impl PDRouter {
                 }
             }
         }
+
+        // Propagate trace context (injects router span as parent when OTel is enabled)
+        request = header_utils::propagate_trace_headers(request, headers);
+
         request
     }
 
