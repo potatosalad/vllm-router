@@ -236,6 +236,59 @@ fn test_otel_distributed_tracing() {
         eprintln!("PASS: Section 3 - Baggage survives enabled path");
     }
 
+    // =====================================================================
+    // Section 4: Client spans can be exported with proper kind and attrs
+    // =====================================================================
+    {
+        let (exporter, provider, _guard) = setup_test_otel();
+
+        let span = info_span!(
+            target: "otel_trace",
+            "http_client_request",
+            otel.kind = "client",
+            otel.name = "POST /v1/chat/completions",
+            http.request.method = "POST",
+            http.route = "/v1/chat/completions",
+            url.full = "http://127.0.0.1:3000/v1/chat/completions",
+        );
+
+        {
+            let _enter = span.enter();
+        }
+        drop(span);
+        provider.force_flush();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let client_span = spans
+            .iter()
+            .find(|span| span.span_kind == opentelemetry::trace::SpanKind::Client)
+            .expect("Expected a client span to be exported");
+
+        let attrs: std::collections::HashMap<String, String> = client_span
+            .attributes
+            .iter()
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+
+        assert_eq!(
+            attrs.get("http.request.method").map(|value| value.as_str()),
+            Some("POST"),
+            "Client span should record the HTTP method"
+        );
+        assert_eq!(
+            attrs.get("http.route").map(|value| value.as_str()),
+            Some("/v1/chat/completions"),
+            "Client span should record the logical route"
+        );
+        assert_eq!(
+            attrs.get("url.full").map(|value| value.as_str()),
+            Some("http://127.0.0.1:3000/v1/chat/completions"),
+            "Client span should record the backend URL"
+        );
+
+        eprintln!("PASS: Section 4 - Client span kind and attrs");
+    }
+
     // Clean up global state
     otel_trace::shutdown_otel();
 }

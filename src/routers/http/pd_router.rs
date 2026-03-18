@@ -9,6 +9,7 @@ use crate::core::{
     RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct PDRouter {
@@ -1007,21 +1008,9 @@ impl PDRouter {
             None
         };
 
-        let otel_enabled = crate::otel_trace::is_otel_enabled();
-
         // Build decode request with shared client
-        let decode_span = if otel_enabled {
-            info_span!(
-                target: "otel_trace",
-                "pd_backend_request",
-                vllm.request_phase = "decode",
-                peer.address = %decode.url(),
-            )
-        } else {
-            tracing::Span::none()
-        };
-        let decode_request = if otel_enabled {
-            let _enter = decode_span.enter();
+        let decode_request_url = Self::backend_request_url(decode.url(), context.route);
+        let decode_request = otel_http::prepare_client_request(
             self.build_post_with_headers(
                 &self.client,
                 decode.url(),
@@ -1029,17 +1018,15 @@ impl PDRouter {
                 &json_request,
                 headers,
                 false,
-            )
-        } else {
-            self.build_post_with_headers(
-                &self.client,
-                decode.url(),
-                context.route,
-                &json_request,
-                headers,
-                false,
-            )
-        };
+            ),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_request_url,
+                route: Some(context.route),
+                request_phase: Some("decode"),
+            },
+        );
 
         // Send both requests concurrently
         debug!(
@@ -1050,18 +1037,8 @@ impl PDRouter {
 
         if context.return_logprob {
             // Build prefill request with shared client when we need response body
-            let prefill_span = if otel_enabled {
-                info_span!(
-                    target: "otel_trace",
-                    "pd_backend_request",
-                    vllm.request_phase = "prefill",
-                    peer.address = %prefill.url(),
-                )
-            } else {
-                tracing::Span::none()
-            };
-            let prefill_request = if otel_enabled {
-                let _enter = prefill_span.enter();
+            let prefill_request_url = Self::backend_request_url(prefill.url(), context.route);
+            let prefill_request = otel_http::prepare_client_request(
                 self.build_post_with_headers(
                     &self.client,
                     prefill.url(),
@@ -1069,26 +1046,18 @@ impl PDRouter {
                     &json_request,
                     headers,
                     false,
-                )
-            } else {
-                self.build_post_with_headers(
-                    &self.client,
-                    prefill.url(),
-                    context.route,
-                    &json_request,
-                    headers,
-                    false,
-                )
-            };
+                ),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &prefill_request_url,
+                    route: Some(context.route),
+                    request_phase: Some("prefill"),
+                },
+            );
             // When we need logprobs, wait for both responses
-            let (prefill_result, decode_result) = if otel_enabled {
-                tokio::join!(
-                    prefill_request.send().instrument(prefill_span),
-                    decode_request.send().instrument(decode_span),
-                )
-            } else {
-                tokio::join!(prefill_request.send(), decode_request.send())
-            };
+            let (prefill_result, decode_result) =
+                tokio::join!(prefill_request.send(), decode_request.send());
             debug!("Received responses from both servers");
 
             // Update metrics
@@ -1183,18 +1152,8 @@ impl PDRouter {
             // When we don't need logprobs, only wait for decode response
             // Send both requests concurrently but don't wait for prefill
             // Use dedicated prefill client with Connection: close
-            let prefill_span = if otel_enabled {
-                info_span!(
-                    target: "otel_trace",
-                    "pd_backend_request",
-                    vllm.request_phase = "prefill",
-                    peer.address = %prefill.url(),
-                )
-            } else {
-                tracing::Span::none()
-            };
-            let prefill_request = if otel_enabled {
-                let _enter = prefill_span.enter();
+            let prefill_request_url = Self::backend_request_url(prefill.url(), context.route);
+            let prefill_request = otel_http::prepare_client_request(
                 self.build_post_with_headers(
                     &self.prefill_client,
                     prefill.url(),
@@ -1202,102 +1161,56 @@ impl PDRouter {
                     &json_request,
                     headers,
                     true,
-                )
-            } else {
-                self.build_post_with_headers(
-                    &self.prefill_client,
-                    prefill.url(),
-                    context.route,
-                    &json_request,
-                    headers,
-                    true,
-                )
-            };
+                ),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &prefill_request_url,
+                    route: Some(context.route),
+                    request_phase: Some("prefill"),
+                },
+            );
 
             // Send prefill response to background worker for draining
             // This ensures HTTP compliance without blocking
             let drain_tx = self.prefill_drain_tx.clone();
             let prefill_url = prefill.url().to_string();
-            if otel_enabled {
-                tokio::spawn(async move {
-                    if let Ok(response) = prefill_request.send().instrument(prefill_span).await {
-                        // Try to send to drain worker
-                        // If channel is full (under extreme load), drain inline as fallback
-                        match drain_tx.try_send(response) {
-                            Ok(_) => {
-                                // Successfully queued for draining
-                                debug!("Prefill response queued for draining");
-                            }
-                            Err(mpsc::error::TrySendError::Full(response)) => {
-                                // Channel full - drain inline as fallback
-                                warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
-                                RouterMetrics::record_pd_prefill_error(&prefill_url);
+            tokio::spawn(async move {
+                if let Ok(response) = prefill_request.send().await {
+                    // Try to send to drain worker
+                    // If channel is full (under extreme load), drain inline as fallback
+                    match drain_tx.try_send(response) {
+                        Ok(_) => {
+                            // Successfully queued for draining
+                            debug!("Prefill response queued for draining");
+                        }
+                        Err(mpsc::error::TrySendError::Full(response)) => {
+                            // Channel full - drain inline as fallback
+                            warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
+                            RouterMetrics::record_pd_prefill_error(&prefill_url);
 
-                                // Drain inline with timeout to prevent blocking too long
-                                let drain_future = async {
-                                    let mut stream = response.bytes_stream();
-                                    while stream.next().await.is_some() {
-                                        // Just drain
-                                    }
-                                };
-
-                                match tokio::time::timeout(Duration::from_secs(1), drain_future)
-                                    .await
-                                {
-                                    Ok(_) => debug!("Inline drain completed for {}", prefill_url),
-                                    Err(_) => error!("Inline drain timeout for {}", prefill_url),
+                            // Drain inline with timeout to prevent blocking too long
+                            let drain_future = async {
+                                let mut stream = response.bytes_stream();
+                                while stream.next().await.is_some() {
+                                    // Just drain
                                 }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                error!("Prefill drain channel closed!");
+                            };
+
+                            match tokio::time::timeout(Duration::from_secs(1), drain_future).await {
+                                Ok(_) => debug!("Inline drain completed for {}", prefill_url),
+                                Err(_) => error!("Inline drain timeout for {}", prefill_url),
                             }
                         }
-                    }
-                });
-            } else {
-                tokio::spawn(async move {
-                    if let Ok(response) = prefill_request.send().await {
-                        // Try to send to drain worker
-                        // If channel is full (under extreme load), drain inline as fallback
-                        match drain_tx.try_send(response) {
-                            Ok(_) => {
-                                // Successfully queued for draining
-                                debug!("Prefill response queued for draining");
-                            }
-                            Err(mpsc::error::TrySendError::Full(response)) => {
-                                // Channel full - drain inline as fallback
-                                warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
-                                RouterMetrics::record_pd_prefill_error(&prefill_url);
-
-                                // Drain inline with timeout to prevent blocking too long
-                                let drain_future = async {
-                                    let mut stream = response.bytes_stream();
-                                    while stream.next().await.is_some() {
-                                        // Just drain
-                                    }
-                                };
-
-                                match tokio::time::timeout(Duration::from_secs(1), drain_future)
-                                    .await
-                                {
-                                    Ok(_) => debug!("Inline drain completed for {}", prefill_url),
-                                    Err(_) => error!("Inline drain timeout for {}", prefill_url),
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                error!("Prefill drain channel closed!");
-                            }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            error!("Prefill drain channel closed!");
                         }
                     }
-                });
-            }
+                }
+            });
 
             // Wait only for decode response
-            let decode_result = if otel_enabled {
-                decode_request.send().instrument(decode_span).await
-            } else {
-                decode_request.send().await
-            };
+            let decode_result = decode_request.send().await;
             debug!("Received decode response");
 
             // Update metrics
@@ -1755,6 +1668,11 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
+    fn backend_request_url(url: &str, route: &str) -> String {
+        let (base_url, _) = super::dp_utils::parse_worker_url(url);
+        api_path(&base_url, route)
+    }
+
     fn build_post_with_headers(
         &self,
         client: &Client,
@@ -1796,9 +1714,6 @@ impl PDRouter {
                 }
             }
         }
-
-        // Propagate trace context (injects router span as parent when OTel is enabled)
-        request = header_utils::propagate_trace_headers(request, headers);
 
         request
     }

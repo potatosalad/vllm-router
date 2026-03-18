@@ -1,6 +1,5 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PDRouter to handle vLLM-specific two-stage processing
-use super::super::header_utils;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PDRouter;
@@ -8,6 +7,7 @@ use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// vLLM PD Router that extends PDRouter with vLLM-specific request handling
@@ -420,33 +420,19 @@ impl VllmPDRouter {
             );
         }
 
-        let otel_enabled = crate::otel_trace::is_otel_enabled();
-        let prefill_response = match if otel_enabled {
-            let prefill_span = info_span!(
-                target: "otel_trace",
-                "pd_backend_request",
-                vllm.request_phase = "prefill",
-                peer.address = %prefill_base_http,
-            );
-            // Propagate trace headers inside span scope so backends see pd_backend_request as parent
-            {
-                let _enter = prefill_span.enter();
-                prefill_request_builder =
-                    header_utils::propagate_trace_headers(prefill_request_builder, headers);
-            }
-            prefill_request_builder
-                .body(prefill_request_str)
-                .send()
-                .instrument(prefill_span)
-                .await
-        } else {
-            prefill_request_builder =
-                header_utils::propagate_trace_headers(prefill_request_builder, headers);
-            prefill_request_builder
-                .body(prefill_request_str)
-                .send()
-                .await
-        } {
+        let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+        let prefill_response = match otel_http::send_client_request(
+            prefill_request_builder.body(prefill_request_str),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &prefill_request_url,
+                route: Some(path),
+                request_phase: Some("prefill"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);
@@ -552,30 +538,19 @@ impl VllmPDRouter {
             );
         }
 
-        let otel_enabled = crate::otel_trace::is_otel_enabled();
-        let decode_response = match if otel_enabled {
-            let decode_span = info_span!(
-                target: "otel_trace",
-                "pd_backend_request",
-                vllm.request_phase = "decode",
-                peer.address = %decode_base_http,
-            );
-            // Propagate trace headers inside span scope so backends see pd_backend_request as parent
-            {
-                let _enter = decode_span.enter();
-                decode_request_builder =
-                    header_utils::propagate_trace_headers(decode_request_builder, headers);
-            }
-            decode_request_builder
-                .body(decode_request_str)
-                .send()
-                .instrument(decode_span)
-                .await
-        } else {
-            decode_request_builder =
-                header_utils::propagate_trace_headers(decode_request_builder, headers);
-            decode_request_builder.body(decode_request_str).send().await
-        } {
+        let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_response = match otel_http::send_client_request(
+            decode_request_builder.body(decode_request_str),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_request_url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);
@@ -786,30 +761,18 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let otel_enabled = crate::otel_trace::is_otel_enabled();
-        let prefill_response = match if otel_enabled {
-            let prefill_span = info_span!(
-                target: "otel_trace",
-                "pd_backend_request",
-                vllm.request_phase = "prefill",
-                peer.address = %prefill_url,
-            );
-            // Propagate trace headers inside span scope so backends see pd_backend_request as parent
-            {
-                let _enter = prefill_span.enter();
-                prefill_request_builder =
-                    header_utils::propagate_trace_headers(prefill_request_builder, headers);
-            }
-            prefill_request_builder
-                .json(&prefill_request)
-                .send()
-                .instrument(prefill_span)
-                .await
-        } else {
-            prefill_request_builder =
-                header_utils::propagate_trace_headers(prefill_request_builder, headers);
-            prefill_request_builder.json(&prefill_request).send().await
-        } {
+        let prefill_response = match otel_http::send_client_request(
+            prefill_request_builder.json(&prefill_request),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &prefill_url,
+                route: Some(path),
+                request_phase: Some("prefill"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
@@ -947,30 +910,18 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let otel_enabled = crate::otel_trace::is_otel_enabled();
-        let decode_response = match if otel_enabled {
-            let decode_span = info_span!(
-                target: "otel_trace",
-                "pd_backend_request",
-                vllm.request_phase = "decode",
-                peer.address = %decode_url,
-            );
-            // Propagate trace headers inside span scope so backends see pd_backend_request as parent
-            {
-                let _enter = decode_span.enter();
-                decode_request_builder =
-                    header_utils::propagate_trace_headers(decode_request_builder, headers);
-            }
-            decode_request_builder
-                .json(&decode_request)
-                .send()
-                .instrument(decode_span)
-                .await
-        } else {
-            decode_request_builder =
-                header_utils::propagate_trace_headers(decode_request_builder, headers);
-            decode_request_builder.json(&decode_request).send().await
-        } {
+        let decode_response = match otel_http::send_client_request(
+            decode_request_builder.json(&decode_request),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &decode_url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();

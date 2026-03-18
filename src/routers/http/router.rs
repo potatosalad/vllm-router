@@ -4,6 +4,7 @@ use crate::core::{
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
+use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
@@ -28,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, warn};
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -739,47 +740,48 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
-        let (mut request_builder, extracted_dp_rank) = if self.intra_node_data_parallel_size > 1 {
-            let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
-                Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
-                }
+        let (mut request_builder, extracted_dp_rank, request_url) =
+            if self.intra_node_data_parallel_size > 1 {
+                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
+                    Ok(tup) => tup,
+                    Err(e) => {
+                        error!("Failed to extract dp_rank: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Parse the request body
+                let json_val = match serde_json::to_value(typed_req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Convert into serde_json::Value failed: {}", e),
+                        )
+                            .into_response();
+                    }
+                };
+
+                // Use the original json_val without modification
+
+                let request_url = format!("{}{}", worker_url_prefix, route);
+                (
+                    self.client.post(&request_url).json(&json_val),
+                    Some(dp_rank),
+                    request_url,
+                )
+            } else {
+                let request_url = format!("{}{}", worker_url, route);
+                (
+                    self.client.post(&request_url).json(typed_req),
+                    None,
+                    request_url,
+                )
             };
-
-            // Parse the request body
-            let json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Use the original json_val without modification
-
-            (
-                self.client
-                    .post(format!("{}{}", worker_url_prefix, route))
-                    .json(&json_val),
-                Some(dp_rank),
-            )
-        } else {
-            (
-                self.client
-                    .post(format!("{}{}", worker_url, route))
-                    .json(typed_req),
-                None,
-            ) // Use json() directly with typed request
-        };
 
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
@@ -802,25 +804,18 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
-        let otel_enabled = crate::otel_trace::is_otel_enabled();
-        let res = match if otel_enabled {
-            let backend_span = info_span!(
-                target: "otel_trace",
-                "backend_request",
-                vllm.request_phase = "inference",
-                peer.address = %worker_url,
-                http.route = %route,
-            );
-            // Propagate trace context inside span scope so backends see backend_request as parent
-            {
-                let _enter = backend_span.enter();
-                request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-            }
-            request_builder.send().instrument(backend_span).await
-        } else {
-            request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-            request_builder.send().await
-        } {
+        let res = match otel_http::send_client_request(
+            request_builder,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &request_url,
+                route: Some(route),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
             Ok(res) => res,
             Err(e) => {
                 error!(

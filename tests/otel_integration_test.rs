@@ -23,9 +23,12 @@ use vllm_router_rs::{
     routers::RouterFactory,
 };
 
-/// Set up OTel with in-memory exporter using set_global_default.
-/// Each test binary runs in its own process, so this is safe.
-fn setup_otel_harness() -> (InMemorySpanExporter, TracerProvider) {
+/// Set up OTel with an in-memory exporter for one test section.
+fn setup_otel_harness() -> (
+    InMemorySpanExporter,
+    TracerProvider,
+    tracing::subscriber::DefaultGuard,
+) {
     let exporter = InMemorySpanExporter::default();
     let provider = TracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -34,7 +37,7 @@ fn setup_otel_harness() -> (InMemorySpanExporter, TracerProvider) {
 
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let subscriber = tracing_subscriber::registry().with(otel_layer);
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    let guard = tracing::subscriber::set_default(subscriber);
 
     global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
         Box::new(TraceContextPropagator::new()),
@@ -42,7 +45,7 @@ fn setup_otel_harness() -> (InMemorySpanExporter, TracerProvider) {
     ]));
     otel_trace::mark_otel_enabled();
 
-    (exporter, provider)
+    (exporter, provider, guard)
 }
 
 fn test_router_config(worker_url: &str) -> RouterConfig {
@@ -67,9 +70,6 @@ async fn test_otel_integration() {
     let port: u16 = worker_url.rsplit(':').next().unwrap().parse().unwrap();
     mock_worker::clear_captured_requests(port);
 
-    // Set up OTel with in-memory exporter
-    let (exporter, provider) = setup_otel_harness();
-
     let config = test_router_config(&worker_url);
     let ctx = common::create_test_context(config.clone());
 
@@ -77,6 +77,8 @@ async fn test_otel_integration() {
     // Section 1: Span attributes on a route through the real app
     // ==================================================================
     {
+        let (exporter, provider, _guard) = setup_otel_harness();
+
         let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
             .await
             .unwrap();
@@ -148,8 +150,6 @@ async fn test_otel_integration() {
             attrs.contains_key("http.response.status_code"),
             "Should record http.response.status_code"
         );
-
-        exporter.reset();
         eprintln!("PASS: Section 1 - Span attributes on health route");
     }
 
@@ -157,6 +157,8 @@ async fn test_otel_integration() {
     // Section 2: Trace propagation to backend via chat completions
     // ==================================================================
     {
+        let (_exporter, _provider, _guard) = setup_otel_harness();
+
         mock_worker::clear_captured_requests(port);
 
         let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
@@ -226,8 +228,6 @@ async fn test_otel_integration() {
             backend_baggage.contains("userId=alice"),
             "baggage should contain userId=alice, got: {backend_baggage}"
         );
-
-        exporter.reset();
         eprintln!("PASS: Section 2 - Trace propagation to backend");
     }
 
