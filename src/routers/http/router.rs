@@ -802,19 +802,25 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
-        let backend_span = info_span!(
-            target: "vllm_router_rs::otel-trace",
-            "backend_request",
-            vllm.request_phase = "inference",
-            peer.address = %worker_url,
-            http.route = %route,
-        );
-        // Propagate trace context inside span scope so backends see backend_request as parent
-        {
-            let _enter = backend_span.enter();
+        let otel_enabled = crate::otel_trace::is_otel_enabled();
+        let res = match if otel_enabled {
+            let backend_span = info_span!(
+                target: "otel_trace",
+                "backend_request",
+                vllm.request_phase = "inference",
+                peer.address = %worker_url,
+                http.route = %route,
+            );
+            // Propagate trace context inside span scope so backends see backend_request as parent
+            {
+                let _enter = backend_span.enter();
+                request_builder = header_utils::propagate_trace_headers(request_builder, headers);
+            }
+            request_builder.send().instrument(backend_span).await
+        } else {
             request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-        }
-        let res = match request_builder.send().instrument(backend_span).await {
+            request_builder.send().await
+        } {
             Ok(res) => res,
             Err(e) => {
                 error!(

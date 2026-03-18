@@ -144,6 +144,10 @@ pub struct RequestSpan;
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
+        if !crate::otel_trace::is_otel_enabled() {
+            return Span::none();
+        }
+
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
 
@@ -152,32 +156,31 @@ impl<B> MakeSpan<B> for RequestSpan {
         let route = request
             .extensions()
             .get::<axum::extract::MatchedPath>()
-            .map(|mp| mp.as_str().to_owned());
-        let path_for_name = route.as_deref().unwrap_or_else(|| request.uri().path());
-        let otel_name = format!("{} {}", request.method(), path_for_name);
+            .map(axum::extract::MatchedPath::as_str);
+        let path_for_name = route.unwrap_or_else(|| request.uri().path());
 
         let span = info_span!(
-            target: "vllm_router_rs::otel-trace",
+            target: "otel_trace",
             "http_request",
             otel.kind = "server",
-            otel.name = %otel_name,
+            otel.name = %format_args!("{} {}", request.method(), path_for_name),
             http.request.method = %request.method(),
             http.route = Empty,
             url.path = %request.uri().path(),
             http.response.status_code = Empty,
             request_id = Empty,  // Will be set later
-            latency = Empty,
+            latency_ms = Empty,
             error = Empty,
         );
 
-        if let Some(route) = &route {
-            span.record("http.route", route.as_str());
+        if let Some(route) = route {
+            span.record("http.route", route);
         }
 
         // Extract W3C TraceContext (traceparent/tracestate) from incoming request
         // headers and set it as the parent context on this span. This links the
         // router's span as a child of the upstream caller's trace.
-        if crate::otel_trace::is_otel_enabled() {
+        if !span.is_disabled() {
             let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
                 propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
             });
@@ -228,16 +231,17 @@ impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
         let status = response.status();
 
-        // Record OTel semantic convention attributes
-        span.record("http.response.status_code", status.as_u16());
-        span.record("latency", format!("{:?}", latency));
+        if !span.is_disabled() {
+            // Record OTel semantic convention attributes only when a real span exists.
+            span.record("http.response.status_code", status.as_u16());
+            span.record("latency_ms", latency.as_secs_f64() * 1000.0);
 
-        // Set OTel span status for server errors using the proper API
-        if status.is_server_error() && crate::otel_trace::is_otel_enabled() {
-            span.set_status(opentelemetry::trace::Status::error(format!(
-                "HTTP {}",
-                status.as_u16()
-            )));
+            if status.is_server_error() {
+                span.set_status(opentelemetry::trace::Status::error(format!(
+                    "HTTP {}",
+                    status.as_u16()
+                )));
+            }
         }
 
         // Log the response completion
@@ -281,18 +285,17 @@ impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
             }
         };
 
-        span.record("latency", format!("{:?}", latency));
-        span.record("error", &message);
-
-        if crate::otel_trace::is_otel_enabled() {
-            span.set_status(opentelemetry::trace::Status::error(message.clone()));
-        }
-
         let _enter = span.enter();
         error!(
             target: "vllm_router_rs::response",
             "{message}"
         );
+
+        if !span.is_disabled() {
+            span.record("latency_ms", latency.as_secs_f64() * 1000.0);
+            span.record("error", message.as_str());
+            span.set_status(opentelemetry::trace::Status::error(message));
+        }
     }
 }
 

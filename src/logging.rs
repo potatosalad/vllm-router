@@ -100,7 +100,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     // silently suppresses all info-level OTel spans.
     let env_filter = if otel_layer_config.is_some() {
         env_filter.add_directive(
-            "vllm_router_rs::otel-trace=trace"
+            "otel_trace=trace"
                 .parse()
                 .expect("valid EnvFilter directive"),
         )

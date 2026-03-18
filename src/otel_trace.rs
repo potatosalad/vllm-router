@@ -35,7 +35,7 @@ use tracing_subscriber::{
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PROVIDER: Mutex<Option<TracerProvider>> = Mutex::new(None);
 
-const OTEL_SPAN_TARGET: &str = "vllm_router_rs::otel-trace";
+const OTEL_SPAN_TARGET: &str = "otel_trace";
 
 /// Filter that only allows specific module targets to be exported to OTEL.
 #[derive(Clone, Copy, Default)]

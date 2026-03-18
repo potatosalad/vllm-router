@@ -79,7 +79,7 @@ fn test_otel_distributed_tracing() {
         });
 
         let span = info_span!(
-            target: "vllm_router_rs::otel-trace",
+            target: "otel_trace",
             "http_request",
             method = "POST",
             uri = "/v1/chat/completions"
@@ -212,7 +212,7 @@ fn test_otel_distributed_tracing() {
             propagator.extract(&opentelemetry_http::HeaderExtractor(&incoming_headers))
         });
 
-        let span = info_span!(target: "vllm_router_rs::otel-trace", "http_request");
+        let span = info_span!(target: "otel_trace", "http_request");
         span.set_parent(parent_cx);
 
         let outgoing_headers = {
