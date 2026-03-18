@@ -685,13 +685,11 @@ impl CliArgs {
             },
             trace_config: if self.enable_trace {
                 Some(TraceConfig {
-                    enable_trace: true,
                     otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
                 })
             } else {
                 None
             },
-
         }
     }
 }

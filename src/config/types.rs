@@ -406,11 +406,12 @@ impl Default for MetricsConfig {
     }
 }
 
-/// OpenTelemetry tracing configuration
+/// OpenTelemetry tracing configuration.
+///
+/// Presence of `Some(TraceConfig)` means tracing is enabled;
+/// `None` means tracing is disabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceConfig {
-    /// Whether to enable OpenTelemetry tracing
-    pub enable_trace: bool,
     /// OTLP collector endpoint (format: host:port).
     /// When None, the SDK respects OTEL_EXPORTER_OTLP_ENDPOINT.
     pub otlp_traces_endpoint: Option<String>,
@@ -419,7 +420,6 @@ pub struct TraceConfig {
 impl Default for TraceConfig {
     fn default() -> Self {
         Self {
-            enable_trace: false,
             otlp_traces_endpoint: None,
         }
     }

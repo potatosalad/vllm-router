@@ -72,11 +72,7 @@ where
     }
 }
 
-pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()> {
-    if !enable {
-        ENABLED.store(false, Ordering::Release);
-        return Ok(());
-    }
+pub fn otel_tracing_init(otlp_endpoint: Option<&str>) -> Result<()> {
 
     global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
         Box::new(TraceContextPropagator::new()),

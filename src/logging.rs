@@ -98,10 +98,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     // When OTel tracing is enabled, ensure the OTel span target passes through
     // the global EnvFilter regardless of log level. Without this, --log-level warn
     // silently suppresses all info-level OTel spans.
-    let env_filter = if otel_layer_config
-        .as_ref()
-        .map_or(false, |c| c.enable_trace)
-    {
+    let env_filter = if otel_layer_config.is_some() {
         env_filter.add_directive(
             "vllm_router_rs::otel-trace=trace"
                 .parse()
@@ -169,16 +166,14 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     }
 
     let mut otel_layer_added = false;
-    if let Some(otel_layer_config) = &otel_layer_config {
-        if otel_layer_config.enable_trace {
-            match get_otel_layer() {
-                Ok(otel_layer) => {
-                    layers.push(otel_layer);
-                    otel_layer_added = true;
-                }
-                Err(e) => {
-                    eprintln!("Failed to initialize OpenTelemetry layer: {e}");
-                }
+    if otel_layer_config.is_some() {
+        match get_otel_layer() {
+            Ok(otel_layer) => {
+                layers.push(otel_layer);
+                otel_layer_added = true;
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize OpenTelemetry layer: {e}");
             }
         }
     }
