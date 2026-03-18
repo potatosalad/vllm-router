@@ -18,7 +18,6 @@ use opentelemetry_sdk::{
     trace::{BatchConfigBuilder, BatchSpanProcessor, Tracer as SdkTracer, TracerProvider},
     Resource,
 };
-use tokio::task::spawn_blocking;
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
@@ -170,22 +169,6 @@ pub fn is_otel_enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
-pub async fn flush_spans_async() -> Result<()> {
-    if !is_otel_enabled() {
-        return Ok(());
-    }
-
-    let provider = PROVIDER
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Provider not initialized"))?
-        .clone();
-
-    spawn_blocking(move || provider.force_flush())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to flush spans: {e}"))?;
-
-    Ok(())
-}
 
 pub fn shutdown_otel() {
     if ENABLED.load(Ordering::Acquire) {
