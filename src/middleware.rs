@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
 
@@ -144,7 +145,7 @@ impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
-        info_span!(
+        let span = info_span!(
             target: "vllm_router_rs::otel-trace",
             "http_request",
             method = %request.method(),
@@ -154,7 +155,19 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-        )
+        );
+
+        // Extract W3C TraceContext (traceparent/tracestate) from incoming request
+        // headers and set it as the parent context on this span. This links the
+        // router's span as a child of the upstream caller's trace.
+        if crate::otel_trace::is_otel_enabled() {
+            let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+                propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
+            });
+            span.set_parent(parent_cx);
+        }
+
+        span
     }
 }
 

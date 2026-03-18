@@ -518,6 +518,7 @@ impl Router {
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
+                trace_config: None,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
