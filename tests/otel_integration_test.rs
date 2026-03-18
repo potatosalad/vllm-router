@@ -9,11 +9,7 @@ mod common;
 use axum::http::{Request, StatusCode};
 use common::mock_worker::{self, MockWorker, MockWorkerConfig};
 use common::test_app::create_test_app;
-use opentelemetry::{
-    global,
-    propagation::TextMapCompositePropagator,
-    trace::TracerProvider as _,
-};
+use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider as _};
 use opentelemetry_sdk::{
     propagation::{BaggagePropagator, TraceContextPropagator},
     testing::trace::InMemorySpanExporter,
@@ -113,14 +109,11 @@ async fn test_otel_integration() {
         // Find the HTTP server span
         let http_span = spans
             .iter()
-            .find(|s| {
-                s.span_kind == opentelemetry::trace::SpanKind::Server
-            })
+            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Server)
             .expect("Should have a SpanKind::Server span");
 
         // Verify trace_id matches upstream
-        let expected_trace_id =
-            opentelemetry::trace::TraceId::from_hex(upstream_trace_id).unwrap();
+        let expected_trace_id = opentelemetry::trace::TraceId::from_hex(upstream_trace_id).unwrap();
         assert_eq!(
             http_span.span_context.trace_id(),
             expected_trace_id,
@@ -128,8 +121,7 @@ async fn test_otel_integration() {
         );
 
         // Verify parent_span_id matches upstream
-        let expected_parent_id =
-            opentelemetry::trace::SpanId::from_hex(upstream_span_id).unwrap();
+        let expected_parent_id = opentelemetry::trace::SpanId::from_hex(upstream_span_id).unwrap();
         assert_eq!(
             http_span.parent_span_id, expected_parent_id,
             "Span parent_span_id should match upstream"

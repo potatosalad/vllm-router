@@ -1053,11 +1053,10 @@ impl PDRouter {
                 )
             };
             // When we need logprobs, wait for both responses
-            let (prefill_result, decode_result) =
-                tokio::join!(
-                    prefill_request.send().instrument(prefill_span),
-                    decode_request.send().instrument(decode_span),
-                );
+            let (prefill_result, decode_result) = tokio::join!(
+                prefill_request.send().instrument(prefill_span),
+                decode_request.send().instrument(decode_span),
+            );
             debug!("Received responses from both servers");
 
             // Update metrics

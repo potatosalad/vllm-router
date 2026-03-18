@@ -9,6 +9,7 @@ pub mod data_connector;
 pub mod grpc;
 pub mod metrics;
 pub mod middleware;
+pub mod otel_trace;
 pub mod policies;
 pub mod protocols;
 pub mod routers;
@@ -16,7 +17,6 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tree;
-pub mod otel_trace;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]

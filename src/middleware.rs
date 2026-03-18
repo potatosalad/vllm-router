@@ -235,7 +235,8 @@ impl<B> OnResponse<B> for ResponseLogger {
         // Set OTel span status for server errors using the proper API
         if status.is_server_error() && crate::otel_trace::is_otel_enabled() {
             span.set_status(opentelemetry::trace::Status::error(format!(
-                "HTTP {}", status.as_u16()
+                "HTTP {}",
+                status.as_u16()
             )));
         }
 

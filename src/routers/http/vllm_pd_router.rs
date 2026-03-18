@@ -555,7 +555,12 @@ impl VllmPDRouter {
             decode_request_builder =
                 header_utils::propagate_trace_headers(decode_request_builder, headers);
         }
-        let decode_response = match decode_request_builder.body(decode_request_str).send().instrument(decode_span).await {
+        let decode_response = match decode_request_builder
+            .body(decode_request_str)
+            .send()
+            .instrument(decode_span)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 let full_error = error_chain(&e);
@@ -778,7 +783,12 @@ impl VllmPDRouter {
             prefill_request_builder =
                 header_utils::propagate_trace_headers(prefill_request_builder, headers);
         }
-        let prefill_response = match prefill_request_builder.json(&prefill_request).send().instrument(prefill_span).await {
+        let prefill_response = match prefill_request_builder
+            .json(&prefill_request)
+            .send()
+            .instrument(prefill_span)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
@@ -928,7 +938,12 @@ impl VllmPDRouter {
             decode_request_builder =
                 header_utils::propagate_trace_headers(decode_request_builder, headers);
         }
-        let decode_response = match decode_request_builder.json(&decode_request).send().instrument(decode_span).await {
+        let decode_response = match decode_request_builder
+            .json(&decode_request)
+            .send()
+            .instrument(decode_span)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();

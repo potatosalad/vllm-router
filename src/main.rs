@@ -208,7 +208,11 @@ struct CliArgs {
     log_level: String,
 
     /// Enable OpenTelemetry tracing
-    #[arg(long, default_value_t = false, help_heading = "Tracing (OpenTelemetry)")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Tracing (OpenTelemetry)"
+    )]
     enable_trace: bool,
 
     /// OTLP collector endpoint (format: host:port). If omitted, respects OTEL_EXPORTER_OTLP_ENDPOINT.

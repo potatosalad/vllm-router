@@ -787,24 +787,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     println!("DEBUG: Initializing logging");
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
-        Some(logging::init_logging(LoggingConfig {
-            level: config
-                .log_level
-                .as_deref()
-                .and_then(|s| match s.to_uppercase().parse::<Level>() {
-                    Ok(l) => Some(l),
-                    Err(_) => {
-                        warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
-                        None
-                    }
-                })
-                .unwrap_or(Level::INFO),
-            json_format: false,
-            log_dir: config.log_dir.clone(),
-            colorize: true,
-            log_file_name: "vllm-router".to_string(),
-            log_targets: None,
-        }, config.trace_config.clone()))
+        Some(logging::init_logging(
+            LoggingConfig {
+                level: config
+                    .log_level
+                    .as_deref()
+                    .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                        Ok(l) => Some(l),
+                        Err(_) => {
+                            warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
+                            None
+                        }
+                    })
+                    .unwrap_or(Level::INFO),
+                json_format: false,
+                log_dir: config.log_dir.clone(),
+                colorize: true,
+                log_file_name: "vllm-router".to_string(),
+                log_targets: None,
+            },
+            config.trace_config.clone(),
+        ))
     } else {
         if config.trace_config.is_some() && !crate::otel_trace::is_otel_enabled() {
             warn!(

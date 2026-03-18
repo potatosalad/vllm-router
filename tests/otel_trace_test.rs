@@ -99,7 +99,10 @@ fn test_otel_distributed_tracing() {
 
         // Verify inbound context was correctly linked
         let spans = exporter.get_finished_spans().unwrap();
-        assert!(!spans.is_empty(), "Expected at least one span to be exported");
+        assert!(
+            !spans.is_empty(),
+            "Expected at least one span to be exported"
+        );
 
         let exported_span = &spans[0];
         let expected_trace_id = TraceId::from_hex(upstream_trace_id).unwrap();

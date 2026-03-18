@@ -10,7 +10,9 @@ use std::{
 
 use anyhow::Result;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider as _, KeyValue};
+use opentelemetry::{
+    global, propagation::TextMapCompositePropagator, trace::TracerProvider as _, KeyValue,
+};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::{BaggagePropagator, TraceContextPropagator},
@@ -126,9 +128,9 @@ pub fn prepare_otel(otlp_endpoint: Option<&str>) -> Result<PreparedOtel> {
         exporter_builder = exporter_builder.with_endpoint(&ep);
     }
 
-    let exporter = exporter_builder.build().map_err(|e| {
-        anyhow::anyhow!("Failed to create OTLP exporter: {e}")
-    })?;
+    let exporter = exporter_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create OTLP exporter: {e}"))?;
 
     let batch_config = BatchConfigBuilder::default()
         .with_scheduled_delay(Duration::from_millis(500))
@@ -181,7 +183,6 @@ pub fn mark_otel_enabled() {
 pub fn is_otel_enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
-
 
 pub fn shutdown_otel() {
     if ENABLED.load(Ordering::Acquire) {
