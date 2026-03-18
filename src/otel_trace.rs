@@ -3,7 +3,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        OnceLock,
+        Mutex,
     },
     time::Duration,
 };
@@ -27,12 +27,11 @@ use tracing_subscriber::{
 
 /// Whether OpenTelemetry tracing is enabled.
 ///
-/// This flag guards access to TRACER and PROVIDER. We use Release/Acquire
-/// ordering to ensure proper synchronization: writes to TRACER/PROVIDER
-/// happen-before the Release store, and Acquire loads happen-before reads.
+/// This flag guards runtime code paths (make_span parent extraction,
+/// inject_trace_context_http). Only set to true after both the OTel layer
+/// and subscriber are installed via `activate_otel`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static TRACER: OnceLock<SdkTracer> = OnceLock::new();
-static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
+static PROVIDER: Mutex<Option<TracerProvider>> = Mutex::new(None);
 
 const OTEL_SPAN_TARGET: &str = "vllm_router_rs::otel-trace";
 
@@ -71,13 +70,36 @@ where
     }
 }
 
-pub fn otel_tracing_init(otlp_endpoint: Option<&str>) -> Result<()> {
+/// Prepared OTel state ready to be activated.
+///
+/// Built by `prepare_otel()`, this holds the provider and tracer without
+/// mutating any global state. Call `layer()` to create the tracing layer,
+/// then `activate_otel()` after the subscriber is installed.
+pub struct PreparedOtel {
+    provider: TracerProvider,
+    tracer: SdkTracer,
+}
 
-    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
-        Box::new(TraceContextPropagator::new()),
-        Box::new(BaggagePropagator::new()),
-    ]));
+impl PreparedOtel {
+    /// Build from pre-existing parts (useful for tests with in-memory exporters).
+    pub fn from_parts(provider: TracerProvider, tracer: SdkTracer) -> Self {
+        Self { provider, tracer }
+    }
 
+    /// Create the tracing-opentelemetry layer for this prepared state.
+    pub fn layer<S>(&self) -> Box<dyn Layer<S> + Send + Sync + 'static>
+    where
+        S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+    {
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(self.tracer.clone())
+            .with_filter(CustomOtelFilter::new());
+        Box::new(layer)
+    }
+}
+
+/// Build OTel provider and tracer without mutating global state.
+pub fn prepare_otel(otlp_endpoint: Option<&str>) -> Result<PreparedOtel> {
     let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_protocol(opentelemetry_otlp::Protocol::Grpc);
@@ -94,7 +116,6 @@ pub fn otel_tracing_init(otlp_endpoint: Option<&str>) -> Result<()> {
     }
 
     let exporter = exporter_builder.build().map_err(|e| {
-        eprintln!("[tracing] Failed to create OTLP exporter: {e}");
         anyhow::anyhow!("Failed to create OTLP exporter: {e}")
     })?;
 
@@ -121,46 +142,29 @@ pub fn otel_tracing_init(otlp_endpoint: Option<&str>) -> Result<()> {
         .with_resource(resource)
         .build();
 
-    PROVIDER
-        .set(provider.clone())
-        .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
-
     let tracer = provider.tracer("vllm-router");
 
-    TRACER
-        .set(tracer)
-        .map_err(|_| anyhow::anyhow!("Tracer already initialized"))?;
-
-    let _ = global::set_tracer_provider(provider);
-
-    eprintln!("[tracing] OpenTelemetry SDK initialized, awaiting subscriber installation");
-    Ok(())
+    Ok(PreparedOtel { provider, tracer })
 }
 
-/// Get the OpenTelemetry tracing layer. Must be called after `otel_tracing_init`.
-pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>>
-where
-    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
-{
-    let tracer = TRACER
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Tracer not initialized. Call otel_tracing_init first."))?
-        .clone();
-
-    let layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer)
-        .with_filter(CustomOtelFilter::new());
-
-    Ok(Box::new(layer))
-}
-
-/// Mark OpenTelemetry tracing as enabled.
+/// Set global propagator and provider, flip ENABLED.
 ///
-/// Must only be called after both the OTel SDK and the tracing subscriber
-/// (with the OTel layer) have been successfully installed.
-pub fn mark_otel_enabled() {
+/// Must be called after the subscriber with the OTel layer is installed.
+pub fn activate_otel(prepared: PreparedOtel) {
+    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]));
+
+    let _ = global::set_tracer_provider(prepared.provider.clone());
+    *PROVIDER.lock().unwrap() = Some(prepared.provider);
     ENABLED.store(true, Ordering::Release);
     tracing::info!("[tracing] OpenTelemetry tracing enabled");
+}
+
+/// Mark OpenTelemetry tracing as enabled (for tests that manage their own provider).
+pub fn mark_otel_enabled() {
+    ENABLED.store(true, Ordering::Release);
 }
 
 /// Check if OpenTelemetry tracing is enabled.
@@ -173,7 +177,9 @@ pub fn is_otel_enabled() -> bool {
 pub fn shutdown_otel() {
     if ENABLED.load(Ordering::Acquire) {
         tracing::info!("[tracing] OpenTelemetry shutting down");
-        global::shutdown_tracer_provider();
+        if let Some(provider) = PROVIDER.lock().unwrap().take() {
+            let _ = provider.shutdown();
+        }
         ENABLED.store(false, Ordering::Release);
     }
 }

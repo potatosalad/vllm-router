@@ -9,7 +9,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::config::TraceConfig;
-use crate::otel_trace::get_otel_layer;
 
 /// Configuration for the logging system
 #[derive(Debug, Clone)]
@@ -165,15 +164,15 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         layers.push(file_layer);
     }
 
-    let mut otel_layer_added = false;
-    if otel_layer_config.is_some() {
-        match get_otel_layer() {
-            Ok(otel_layer) => {
-                layers.push(otel_layer);
-                otel_layer_added = true;
+    let mut prepared_otel = None;
+    if let Some(trace_config) = otel_layer_config {
+        match crate::otel_trace::prepare_otel(trace_config.otlp_traces_endpoint.as_deref()) {
+            Ok(prepared) => {
+                layers.push(prepared.layer());
+                prepared_otel = Some(prepared);
             }
             Err(e) => {
-                eprintln!("Failed to initialize OpenTelemetry layer: {e}");
+                eprintln!("Failed to initialize OpenTelemetry: {e}");
             }
         }
     }
@@ -186,9 +185,12 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .try_init()
         .is_ok();
 
-    // Only report OTel as enabled after both the layer and subscriber are live
-    if otel_layer_added && subscriber_installed {
-        crate::otel_trace::mark_otel_enabled();
+    // Only activate OTel (set global propagator + provider, flip ENABLED)
+    // after both the layer and subscriber are live
+    if let Some(prepared) = prepared_otel {
+        if subscriber_installed {
+            crate::otel_trace::activate_otel(prepared);
+        }
     }
 
     // Return the guard to keep the file appender worker thread alive

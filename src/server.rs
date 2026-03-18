@@ -1,4 +1,3 @@
-use crate::otel_trace;
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, TraceConfig},
     core::{WorkerRegistry, WorkerType},
@@ -785,14 +784,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Only initialize logging if not already done (for Python bindings support)
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-    if let Some(trace_config) = &config.trace_config {
-        if let Err(e) = otel_trace::otel_tracing_init(
-            trace_config.otlp_traces_endpoint.as_deref(),
-        ) {
-            eprintln!("Failed to initialize OpenTelemetry: {e}");
-        }
-    }
 
     println!("DEBUG: Initializing logging");
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
