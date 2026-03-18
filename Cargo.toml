@@ -113,6 +113,11 @@ name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"
 
+[[bench]]
+name = "otel_disabled_path"
+harness = false
+path = "benches/otel_disabled_path.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
