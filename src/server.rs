@@ -806,6 +806,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             log_targets: None,
         }, config.trace_config.clone()))
     } else {
+        if config.trace_config.is_some() && !crate::otel_trace::is_otel_enabled() {
+            warn!(
+                "Tracing was requested after logging was already initialized; \
+                 the existing subscriber will continue without enabling OpenTelemetry"
+            );
+        }
         None
     };
     println!("DEBUG: Logging initialized");
