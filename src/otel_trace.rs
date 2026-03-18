@@ -112,10 +112,14 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         .with_batch_config(batch_config)
         .build();
 
-    let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
-        "service.name",
-        "vllm-router",
-    )]));
+    let mut resource_attrs = vec![
+        KeyValue::new("service.name", "vllm-router"),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+    ];
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        resource_attrs.push(KeyValue::new("service.instance.id", hostname));
+    }
+    let resource = Resource::default().merge(&Resource::new(resource_attrs));
 
     let provider = TracerProvider::builder()
         .with_span_processor(span_processor)
