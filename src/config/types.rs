@@ -410,19 +410,11 @@ impl Default for MetricsConfig {
 ///
 /// Presence of `Some(TraceConfig)` means tracing is enabled;
 /// `None` means tracing is disabled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceConfig {
     /// OTLP collector endpoint (format: host:port).
     /// When None, the SDK respects OTEL_EXPORTER_OTLP_ENDPOINT.
     pub otlp_traces_endpoint: Option<String>,
-}
-
-impl Default for TraceConfig {
-    fn default() -> Self {
-        Self {
-            otlp_traces_endpoint: None,
-        }
-    }
 }
 
 impl Default for RouterConfig {

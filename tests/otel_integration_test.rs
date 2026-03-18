@@ -77,7 +77,7 @@ async fn test_otel_integration() {
     // Section 1: Span attributes on a route through the real app
     // ==================================================================
     {
-        let router = RouterFactory::create_regular_router(&[worker_url.clone()], &ctx)
+        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
             .await
             .unwrap();
         let app = create_test_app(
@@ -159,7 +159,7 @@ async fn test_otel_integration() {
     {
         mock_worker::clear_captured_requests(port);
 
-        let router = RouterFactory::create_regular_router(&[worker_url.clone()], &ctx)
+        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
             .await
             .unwrap();
         let app = create_test_app(
