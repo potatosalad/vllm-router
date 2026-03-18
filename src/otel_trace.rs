@@ -160,7 +160,7 @@ where
 /// (with the OTel layer) have been successfully installed.
 pub fn mark_otel_enabled() {
     ENABLED.store(true, Ordering::Release);
-    eprintln!("[tracing] OpenTelemetry tracing enabled");
+    tracing::info!("[tracing] OpenTelemetry tracing enabled");
 }
 
 /// Check if OpenTelemetry tracing is enabled.
@@ -172,9 +172,9 @@ pub fn is_otel_enabled() -> bool {
 
 pub fn shutdown_otel() {
     if ENABLED.load(Ordering::Acquire) {
+        tracing::info!("[tracing] OpenTelemetry shutting down");
         global::shutdown_tracer_provider();
         ENABLED.store(false, Ordering::Release);
-        eprintln!("[tracing] OpenTelemetry shut down");
     }
 }
 
