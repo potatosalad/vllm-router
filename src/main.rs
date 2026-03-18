@@ -219,6 +219,14 @@ struct CliArgs {
     #[arg(long, help_heading = "Tracing (OpenTelemetry)")]
     otlp_traces_endpoint: Option<String>,
 
+    /// Parent-based sampling ratio for OpenTelemetry traces.
+    #[arg(long, default_value_t = 1.0, help_heading = "Tracing (OpenTelemetry)")]
+    otel_sampling_ratio: f64,
+
+    /// Exact HTTP paths to exclude from OpenTelemetry server spans.
+    #[arg(long, num_args = 0.., help_heading = "Tracing (OpenTelemetry)")]
+    otel_excluded_paths: Vec<String>,
+
     /// Enable Kubernetes service discovery
     #[arg(long, default_value_t = false)]
     service_discovery: bool,
@@ -690,6 +698,12 @@ impl CliArgs {
             trace_config: if self.enable_trace {
                 Some(TraceConfig {
                     otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                    sampling_ratio: self.otel_sampling_ratio,
+                    excluded_paths: if self.otel_excluded_paths.is_empty() {
+                        TraceConfig::default_excluded_paths()
+                    } else {
+                        self.otel_excluded_paths.clone()
+                    },
                 })
             } else {
                 None

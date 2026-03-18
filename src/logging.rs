@@ -167,7 +167,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     let mut prepared_otel = None;
     if let Some(trace_config) = otel_layer_config {
-        match crate::otel_trace::prepare_otel(trace_config.otlp_traces_endpoint.as_deref()) {
+        match crate::otel_trace::prepare_otel(&trace_config) {
             Ok(prepared) => {
                 layers.push(prepared.layer());
                 prepared_otel = Some(prepared);

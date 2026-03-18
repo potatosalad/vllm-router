@@ -144,7 +144,10 @@ pub struct RequestSpan;
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
-        if !crate::otel_trace::is_otel_enabled() {
+        let request_path = request.uri().path();
+        if !crate::otel_trace::is_otel_enabled()
+            || crate::otel_trace::is_excluded_http_path(request_path)
+        {
             return Span::none();
         }
 
@@ -157,7 +160,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             .extensions()
             .get::<axum::extract::MatchedPath>()
             .map(axum::extract::MatchedPath::as_str);
-        let path_for_name = route.unwrap_or_else(|| request.uri().path());
+        let path_for_name = route.unwrap_or(request_path);
 
         let span = info_span!(
             target: "otel_trace",
@@ -166,7 +169,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             otel.name = %format_args!("{} {}", request.method(), path_for_name),
             http.request.method = %request.method(),
             http.route = Empty,
-            url.path = %request.uri().path(),
+            url.path = %request_path,
             http.response.status_code = Empty,
             request_id = Empty,  // Will be set later
             latency_ms = Empty,

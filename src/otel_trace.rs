@@ -3,7 +3,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -17,7 +17,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::{BaggagePropagator, TraceContextPropagator},
     runtime,
-    trace::{BatchConfigBuilder, BatchSpanProcessor, Tracer as SdkTracer, TracerProvider},
+    trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler, Tracer as SdkTracer, TracerProvider},
     Resource,
 };
 use tracing::{Metadata, Subscriber};
@@ -27,6 +27,8 @@ use tracing_subscriber::{
     Layer,
 };
 
+use crate::config::TraceConfig;
+
 /// Whether OpenTelemetry tracing is enabled.
 ///
 /// This flag guards runtime code paths (make_span parent extraction,
@@ -34,6 +36,7 @@ use tracing_subscriber::{
 /// and subscriber are installed via `activate_otel`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PROVIDER: Mutex<Option<TracerProvider>> = Mutex::new(None);
+static EXCLUDED_PATHS: OnceLock<Box<[String]>> = OnceLock::new();
 
 const OTEL_SPAN_TARGET: &str = "otel_trace";
 
@@ -80,12 +83,26 @@ where
 pub struct PreparedOtel {
     provider: TracerProvider,
     tracer: SdkTracer,
+    excluded_paths: Box<[String]>,
 }
 
 impl PreparedOtel {
     /// Build from pre-existing parts (useful for tests with in-memory exporters).
     pub fn from_parts(provider: TracerProvider, tracer: SdkTracer) -> Self {
-        Self { provider, tracer }
+        Self::from_parts_with_excluded_paths(provider, tracer, Vec::new())
+    }
+
+    /// Build from pre-existing parts with an explicit excluded-path list.
+    pub fn from_parts_with_excluded_paths(
+        provider: TracerProvider,
+        tracer: SdkTracer,
+        excluded_paths: Vec<String>,
+    ) -> Self {
+        Self {
+            provider,
+            tracer,
+            excluded_paths: excluded_paths.into_boxed_slice(),
+        }
     }
 
     /// Create the tracing-opentelemetry layer for this prepared state.
@@ -111,15 +128,31 @@ fn service_instance_id() -> String {
     }
 }
 
+fn parent_based_sampler(sampling_ratio: f64) -> Sampler {
+    if sampling_ratio <= 0.0 {
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOff))
+    } else if sampling_ratio >= 1.0 {
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
+    } else {
+        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(sampling_ratio)))
+    }
+}
+
 /// Build OTel provider and tracer without mutating global state.
-pub fn prepare_otel(otlp_endpoint: Option<&str>) -> Result<PreparedOtel> {
+pub fn prepare_otel(trace_config: &TraceConfig) -> Result<PreparedOtel> {
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&trace_config.sampling_ratio),
+        "OTel sampling_ratio must be within [0.0, 1.0], got {}",
+        trace_config.sampling_ratio
+    );
+
     let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_protocol(opentelemetry_otlp::Protocol::Grpc);
 
     // Only set the endpoint explicitly when configured; otherwise the SDK
     // respects OTEL_EXPORTER_OTLP_ENDPOINT (defaulting to localhost:4317).
-    if let Some(ep) = otlp_endpoint {
+    if let Some(ep) = trace_config.otlp_traces_endpoint.as_deref() {
         let ep = if !ep.starts_with("http://") && !ep.starts_with("https://") {
             format!("http://{ep}")
         } else {
@@ -149,26 +182,38 @@ pub fn prepare_otel(otlp_endpoint: Option<&str>) -> Result<PreparedOtel> {
     let resource = Resource::default().merge(&Resource::new(resource_attrs));
 
     let provider = TracerProvider::builder()
+        .with_sampler(parent_based_sampler(trace_config.sampling_ratio))
         .with_span_processor(span_processor)
         .with_resource(resource)
         .build();
 
     let tracer = provider.tracer("vllm-router");
 
-    Ok(PreparedOtel { provider, tracer })
+    Ok(PreparedOtel {
+        provider,
+        tracer,
+        excluded_paths: trace_config.excluded_paths.clone().into_boxed_slice(),
+    })
 }
 
 /// Set global propagator and provider, flip ENABLED.
 ///
 /// Must be called after the subscriber with the OTel layer is installed.
 pub fn activate_otel(prepared: PreparedOtel) {
+    let PreparedOtel {
+        provider,
+        excluded_paths,
+        ..
+    } = prepared;
+
     global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
         Box::new(TraceContextPropagator::new()),
         Box::new(BaggagePropagator::new()),
     ]));
 
-    let _ = global::set_tracer_provider(prepared.provider.clone());
-    *PROVIDER.lock().unwrap() = Some(prepared.provider);
+    let _ = EXCLUDED_PATHS.set(excluded_paths);
+    let _ = global::set_tracer_provider(provider.clone());
+    *PROVIDER.lock().unwrap() = Some(provider);
     ENABLED.store(true, Ordering::Release);
     tracing::info!("[tracing] OpenTelemetry tracing enabled");
 }
@@ -182,6 +227,13 @@ pub fn mark_otel_enabled() {
 #[inline]
 pub fn is_otel_enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
+}
+
+#[inline]
+pub fn is_excluded_http_path(path: &str) -> bool {
+    EXCLUDED_PATHS
+        .get()
+        .is_some_and(|paths| paths.iter().any(|excluded| excluded == path))
 }
 
 pub fn shutdown_otel() {

@@ -531,6 +531,7 @@ impl Router {
                 trace_config: if self.enable_trace {
                     Some(config::TraceConfig {
                         otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                        ..Default::default()
                     })
                 } else {
                     None
