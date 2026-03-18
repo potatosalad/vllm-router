@@ -3,8 +3,9 @@ use reqwest::Client;
 use std::sync::Arc;
 use vllm_router_rs::{
     config::RouterConfig,
+    otel_trace,
     routers::RouterTrait,
-    server::{build_app, AppContext, AppState},
+    server::{build_app_with_request_tracing, AppContext, AppState},
 };
 
 /// Create a test Axum application using the actual server's build_app function
@@ -13,6 +14,17 @@ pub fn create_test_app(
     router: Arc<dyn RouterTrait>,
     client: Client,
     router_config: &RouterConfig,
+) -> Router {
+    create_test_app_with_tracing(router, client, router_config, otel_trace::is_otel_enabled())
+}
+
+/// Create a test Axum application with an explicit request-tracing toggle.
+#[allow(dead_code)]
+pub fn create_test_app_with_tracing(
+    router: Arc<dyn RouterTrait>,
+    client: Client,
+    router_config: &RouterConfig,
+    enable_request_tracing: bool,
 ) -> Router {
     // Create AppContext
     let app_context = Arc::new(
@@ -45,11 +57,12 @@ pub fn create_test_app(
     });
 
     // Use the actual server's build_app function
-    build_app(
+    build_app_with_request_tracing(
         app_state,
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
         true, // enable_transparent_proxy
+        enable_request_tracing,
     )
 }

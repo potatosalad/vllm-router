@@ -699,13 +699,33 @@ pub struct ServerConfig {
     pub trace_config: Option<TraceConfig>,
 }
 
-/// Build the Axum application with all routes and middleware
+/// Build the Axum application with all routes and middleware using the
+/// current runtime OpenTelemetry state.
 pub fn build_app(
     app_state: Arc<AppState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
     enable_transparent_proxy: bool,
+) -> Router {
+    build_app_with_request_tracing(
+        app_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        enable_transparent_proxy,
+        crate::otel_trace::is_otel_enabled(),
+    )
+}
+
+/// Build the Axum application with an explicit request-tracing toggle.
+pub fn build_app_with_request_tracing(
+    app_state: Arc<AppState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    enable_transparent_proxy: bool,
+    enable_request_tracing: bool,
 ) -> Router {
     // Create routes
     let protected_routes = Router::new()
@@ -764,8 +784,15 @@ pub fn build_app(
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
-        ))
-        .layer(middleware::create_logging_layer())
+        ));
+
+    let base_app = if enable_request_tracing {
+        base_app.layer(middleware::create_logging_layer())
+    } else {
+        base_app
+    };
+
+    let base_app = base_app
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins));
 
@@ -1005,12 +1032,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Enable transparent proxy for all routing modes
     let enable_transparent_proxy = true;
 
-    let app = build_app(
+    let app = build_app_with_request_tracing(
         app_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
         enable_transparent_proxy,
+        crate::otel_trace::is_otel_enabled(),
     );
 
     let addr = format!("{}:{}", config.host, config.port);

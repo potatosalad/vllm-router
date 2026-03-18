@@ -1,6 +1,37 @@
-use axum::http::{HeaderMap, HeaderValue, Request};
+mod common;
+
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
+};
+use common::{
+    create_test_context,
+    mock_worker::{MockWorker, MockWorkerConfig},
+    test_app::create_test_app_with_tracing,
+};
+use reqwest::Client;
+use tower::ServiceExt;
 use tower_http::trace::MakeSpan;
-use vllm_router_rs::{middleware::RequestSpan, otel_trace, routers::header_utils};
+use vllm_router_rs::{
+    config::{PolicyConfig, RouterConfig, RoutingMode},
+    middleware::RequestSpan,
+    otel_trace,
+    routers::{header_utils, RouterFactory},
+};
+
+fn test_router_config(worker_url: &str) -> RouterConfig {
+    RouterConfig {
+        mode: RoutingMode::Regular {
+            worker_urls: vec![worker_url.to_string()],
+        },
+        policy: PolicyConfig::RoundRobin,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        ..Default::default()
+    }
+}
 
 #[test]
 fn request_span_is_none_when_otel_disabled() {
@@ -77,4 +108,38 @@ fn propagate_trace_headers_passively_forwards_only_w3c_headers_when_otel_disable
         request.headers().get("x-extra-header").is_none(),
         "Non-trace headers should not be forwarded by propagate_trace_headers"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn app_routes_requests_without_trace_layer_when_otel_disabled() {
+    otel_trace::shutdown_otel();
+
+    let mut worker = MockWorker::new(MockWorkerConfig::default());
+    let worker_url = worker.start().await.expect("Failed to start mock worker");
+
+    let config = test_router_config(&worker_url);
+    let ctx = create_test_context(config.clone());
+    let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
+        .await
+        .expect("Failed to create router");
+    let app = create_test_app_with_tracing(Arc::from(router), Client::new(), &config, false);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/liveness")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request should succeed with tracing disabled");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().contains_key("x-request-id"),
+        "RequestIdLayer should still run when request tracing is disabled"
+    );
+
+    worker.stop().await;
 }
