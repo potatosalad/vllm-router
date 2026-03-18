@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_log::LogTracer;
 use tracing_subscriber::fmt::time::ChronoUtc;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -60,8 +59,10 @@ pub struct LogGuard {
 /// # Panics
 /// Will not panic, as initialization errors are handled gracefully
 pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
-    // Forward logs to tracing - ignore errors to allow for multiple initialization
-    let _ = LogTracer::init();
+    // Note: Do NOT call LogTracer::init() here. The tracing_subscriber
+    // try_init() method handles LogTracer initialization internally (when the
+    // "tracing-log" feature is enabled). Calling it beforehand causes
+    // try_init() to fail because log::set_logger() can only be called once.
 
     // Convert log level to filter string
     let level_filter = match config.level {

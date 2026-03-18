@@ -410,9 +410,7 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // P2P coordination metadata in header
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        prefill_request_builder =
-            header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
         if let Some(rank) = prefill_dp_rank {
@@ -428,6 +426,12 @@ impl VllmPDRouter {
             vllm.request_phase = "prefill",
             peer.address = %prefill_base_http,
         );
+        // Propagate trace headers inside span scope so backends see pd_backend_request as parent
+        {
+            let _enter = prefill_span.enter();
+            prefill_request_builder =
+                header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        }
         let prefill_response = match prefill_request_builder
             .body(prefill_request_str)
             .send()
@@ -529,9 +533,7 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        decode_request_builder =
-            header_utils::propagate_trace_headers(decode_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
         if let Some(rank) = decode_dp_rank {
@@ -547,6 +549,12 @@ impl VllmPDRouter {
             vllm.request_phase = "decode",
             peer.address = %decode_base_http,
         );
+        // Propagate trace headers inside span scope so backends see pd_backend_request as parent
+        {
+            let _enter = decode_span.enter();
+            decode_request_builder =
+                header_utils::propagate_trace_headers(decode_request_builder, headers);
+        }
         let decode_response = match decode_request_builder.body(decode_request_str).send().instrument(decode_span).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -754,9 +762,7 @@ impl VllmPDRouter {
             )
             .header("X-Request-Id", &request_id);
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        prefill_request_builder =
-            header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
@@ -766,6 +772,12 @@ impl VllmPDRouter {
             vllm.request_phase = "prefill",
             peer.address = %prefill_url,
         );
+        // Propagate trace headers inside span scope so backends see pd_backend_request as parent
+        {
+            let _enter = prefill_span.enter();
+            prefill_request_builder =
+                header_utils::propagate_trace_headers(prefill_request_builder, headers);
+        }
         let prefill_response = match prefill_request_builder.json(&prefill_request).send().instrument(prefill_span).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -900,9 +912,7 @@ impl VllmPDRouter {
             )
             .header("X-Request-Id", &request_id);
 
-        // Propagate trace headers and add X-data-parallel-rank header using shared utilities
-        decode_request_builder =
-            header_utils::propagate_trace_headers(decode_request_builder, headers);
+        // Add X-data-parallel-rank header using shared utilities
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
@@ -912,6 +922,12 @@ impl VllmPDRouter {
             vllm.request_phase = "decode",
             peer.address = %decode_url,
         );
+        // Propagate trace headers inside span scope so backends see pd_backend_request as parent
+        {
+            let _enter = decode_span.enter();
+            decode_request_builder =
+                header_utils::propagate_trace_headers(decode_request_builder, headers);
+        }
         let decode_response = match decode_request_builder.json(&decode_request).send().instrument(decode_span).await {
             Ok(resp) => resp,
             Err(e) => {

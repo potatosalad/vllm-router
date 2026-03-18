@@ -1014,14 +1014,17 @@ impl PDRouter {
             vllm.request_phase = "decode",
             peer.address = %decode.url(),
         );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
+        let decode_request = {
+            let _enter = decode_span.enter();
+            self.build_post_with_headers(
+                &self.client,
+                decode.url(),
+                context.route,
+                &json_request,
+                headers,
+                false,
+            )
+        };
 
         // Send both requests concurrently
         debug!(
@@ -1038,14 +1041,17 @@ impl PDRouter {
                 vllm.request_phase = "prefill",
                 peer.address = %prefill.url(),
             );
-            let prefill_request = self.build_post_with_headers(
-                &self.client,
-                prefill.url(),
-                context.route,
-                &json_request,
-                headers,
-                false,
-            );
+            let prefill_request = {
+                let _enter = prefill_span.enter();
+                self.build_post_with_headers(
+                    &self.client,
+                    prefill.url(),
+                    context.route,
+                    &json_request,
+                    headers,
+                    false,
+                )
+            };
             // When we need logprobs, wait for both responses
             let (prefill_result, decode_result) =
                 tokio::join!(
@@ -1152,8 +1158,9 @@ impl PDRouter {
                 vllm.request_phase = "prefill",
                 peer.address = %prefill.url(),
             );
-            let prefill_future = self
-                .build_post_with_headers(
+            let prefill_request = {
+                let _enter = prefill_span.enter();
+                self.build_post_with_headers(
                     &self.prefill_client,
                     prefill.url(),
                     context.route,
@@ -1161,8 +1168,8 @@ impl PDRouter {
                     headers,
                     true,
                 )
-                .send()
-                .instrument(prefill_span);
+            };
+            let prefill_future = prefill_request.send().instrument(prefill_span);
             let decode_future = decode_request.send().instrument(decode_span);
 
             // Send prefill response to background worker for draining

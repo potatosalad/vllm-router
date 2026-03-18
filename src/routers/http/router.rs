@@ -802,9 +802,6 @@ impl Router {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
         }
 
-        // Propagate trace context (injects router span as parent when OTel is enabled)
-        request_builder = header_utils::propagate_trace_headers(request_builder, headers);
-
         let backend_span = info_span!(
             target: "vllm_router_rs::otel-trace",
             "backend_request",
@@ -812,6 +809,11 @@ impl Router {
             peer.address = %worker_url,
             http.route = %route,
         );
+        // Propagate trace context inside span scope so backends see backend_request as parent
+        {
+            let _enter = backend_span.enter();
+            request_builder = header_utils::propagate_trace_headers(request_builder, headers);
+        }
         let res = match request_builder.send().instrument(backend_span).await {
             Ok(res) => res,
             Err(e) => {
