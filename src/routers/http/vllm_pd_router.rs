@@ -760,7 +760,13 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = match prefill_request_builder.json(&prefill_request).send().await {
+        let prefill_span = info_span!(
+            target: "vllm_router_rs::otel-trace",
+            "pd_backend_request",
+            vllm.request_phase = "prefill",
+            peer.address = %prefill_url,
+        );
+        let prefill_response = match prefill_request_builder.json(&prefill_request).send().instrument(prefill_span).await {
             Ok(resp) => resp,
             Err(e) => {
                 prefill_worker.decrement_load();
@@ -900,7 +906,13 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let decode_response = match decode_request_builder.json(&decode_request).send().await {
+        let decode_span = info_span!(
+            target: "vllm_router_rs::otel-trace",
+            "pd_backend_request",
+            vllm.request_phase = "decode",
+            peer.address = %decode_url,
+        );
+        let decode_response = match decode_request_builder.json(&decode_request).send().instrument(decode_span).await {
             Ok(resp) => resp,
             Err(e) => {
                 decode_worker.decrement_load();

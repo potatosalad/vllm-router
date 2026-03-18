@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -799,7 +799,14 @@ impl Router {
         // Propagate trace context (injects router span as parent when OTel is enabled)
         request_builder = header_utils::propagate_trace_headers(request_builder, headers);
 
-        let res = match request_builder.send().await {
+        let backend_span = info_span!(
+            target: "vllm_router_rs::otel-trace",
+            "backend_request",
+            vllm.request_phase = "inference",
+            peer.address = %worker_url,
+            http.route = %route,
+        );
+        let res = match request_builder.send().instrument(backend_span).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
