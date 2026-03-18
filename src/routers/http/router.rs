@@ -781,11 +781,17 @@ impl Router {
             ) // Use json() directly with typed request
         };
 
-        // Copy all headers from original request if provided
+        // Copy all headers from original request if provided, skipping
+        // Content-Type/Content-Length (.json() sets them) and trace headers
+        // (propagate_trace_headers below injects fresh context).
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if *name != CONTENT_TYPE
+                    && *name != CONTENT_LENGTH
+                    && !header_utils::TRACE_HEADER_NAMES
+                        .iter()
+                        .any(|&th| name.as_str().eq_ignore_ascii_case(th))
+                {
                     request_builder = request_builder.header(name, value);
                 }
             }
