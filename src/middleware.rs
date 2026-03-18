@@ -145,14 +145,17 @@ impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
+        let otel_name = format!("{} {}", request.method(), request.uri().path());
         let span = info_span!(
             target: "vllm_router_rs::otel-trace",
             "http_request",
-            method = %request.method(),
-            uri = %request.uri(),
-            version = ?request.version(),
+            otel.kind = "server",
+            otel.name = %otel_name,
+            otel.status_code = Empty,
+            http.request.method = %request.method(),
+            url.path = %request.uri().path(),
+            http.response.status_code = Empty,
             request_id = Empty,  // Will be set later
-            status_code = Empty,
             latency = Empty,
             error = Empty,
         );
@@ -211,9 +214,14 @@ impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
         let status = response.status();
 
-        // Record these in the span for structured logging/observability tools
-        span.record("status_code", status.as_u16());
+        // Record OTel semantic convention attributes
+        span.record("http.response.status_code", status.as_u16());
         span.record("latency", format!("{:?}", latency));
+
+        // Set OTel span status for server errors
+        if status.is_server_error() {
+            span.record("otel.status_code", "ERROR");
+        }
 
         // Log the response completion
         let _enter = span.enter();
