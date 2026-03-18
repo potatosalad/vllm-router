@@ -146,7 +146,16 @@ impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
-        let otel_name = format!("{} {}", request.method(), request.uri().path());
+
+        // Use MatchedPath (route template) when available for low-cardinality
+        // span names, falling back to the raw URI path otherwise.
+        let route = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|mp| mp.as_str().to_owned());
+        let path_for_name = route.as_deref().unwrap_or_else(|| request.uri().path());
+        let otel_name = format!("{} {}", request.method(), path_for_name);
+
         let span = info_span!(
             target: "vllm_router_rs::otel-trace",
             "http_request",
@@ -154,12 +163,17 @@ impl<B> MakeSpan<B> for RequestSpan {
             otel.name = %otel_name,
             otel.status_code = Empty,
             http.request.method = %request.method(),
+            http.route = Empty,
             url.path = %request.uri().path(),
             http.response.status_code = Empty,
             request_id = Empty,  // Will be set later
             latency = Empty,
             error = Empty,
         );
+
+        if let Some(route) = &route {
+            span.record("http.route", route.as_str());
+        }
 
         // Extract W3C TraceContext (traceparent/tracestate) from incoming request
         // headers and set it as the parent context on this span. This links the
