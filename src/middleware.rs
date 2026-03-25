@@ -604,3 +604,74 @@ pub async fn concurrency_limit_middleware(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
+    use metrics::set_default_local_recorder;
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+    use tower::ServiceExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_http_metrics_middleware_uses_matched_route_and_status_labels() {
+        let recorder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Suffix(String::from("duration_seconds")),
+                &[
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0,
+                    30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0,
+                ],
+            )
+            .expect("failed to set buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let app = Router::new()
+            .route(
+                "/widgets/{widget_id}",
+                get(|| async { StatusCode::ACCEPTED }),
+            )
+            .layer(axum::middleware::from_fn(http_metrics_middleware));
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/widgets/123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let rendered = handle.render();
+        let request_line = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_requests_total{"))
+            .expect("missing request counter output");
+        assert!(
+            request_line.contains("route=\"/widgets/{widget_id}\"")
+                && request_line.contains("method=\"GET\"")
+                && request_line.contains("status_code=\"202\"")
+                && request_line.contains("status_class=\"2xx\"")
+                && request_line.ends_with(" 1"),
+            "unexpected request metric line: {request_line}"
+        );
+
+        let duration_line = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_request_duration_seconds_count{"))
+            .expect("missing request duration output");
+        assert!(
+            duration_line.contains("route=\"/widgets/{widget_id}\"")
+                && duration_line.contains("method=\"GET\"")
+                && duration_line.contains("status_class=\"2xx\"")
+                && duration_line.ends_with(" 1"),
+            "unexpected request duration metric line: {duration_line}"
+        );
+    }
+}

@@ -691,7 +691,18 @@ impl TokenizerMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::with_local_recorder;
     use std::net::TcpListener;
+
+    fn build_test_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+        PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Suffix(String::from("duration_seconds")),
+                &DURATION_BUCKETS,
+            )
+            .expect("failed to configure buckets")
+            .build_recorder()
+    }
 
     // ============= PrometheusConfig Tests =============
 
@@ -971,6 +982,86 @@ mod tests {
         RouterMetrics::record_generate_duration(Duration::from_secs(2));
         RouterMetrics::record_embeddings_error(StatusCode::TOO_MANY_REQUESTS);
         RouterMetrics::set_running_requests("http://worker1", 15);
+    }
+
+    #[test]
+    fn test_rendered_metrics_include_structured_http_labels() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            RouterMetrics::observe_request(
+                "/v1/chat/completions",
+                "POST",
+                StatusCode::TOO_MANY_REQUESTS,
+                Duration::from_millis(25),
+            );
+            RouterMetrics::record_request_error(
+                "/v1/chat/completions",
+                "POST",
+                StatusCode::TOO_MANY_REQUESTS,
+                "non_retryable_error",
+            );
+            RouterMetrics::observe_pd_request(
+                "/v1/chat/completions",
+                "POST",
+                StatusCode::BAD_GATEWAY,
+                Duration::from_millis(50),
+            );
+            RouterMetrics::record_pd_prefill_request("http://prefill1", StatusCode::OK);
+            RouterMetrics::record_pd_prefill_error("http://prefill1", "transport", None);
+            RouterMetrics::record_pd_decode_request("http://decode1", StatusCode::BAD_GATEWAY);
+            RouterMetrics::record_pd_decode_error(
+                "http://decode1",
+                "http_response",
+                Some(StatusCode::BAD_GATEWAY),
+            );
+            RouterMetrics::record_embeddings_error(StatusCode::TOO_MANY_REQUESTS);
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_requests_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("method=\"POST\"")
+                && line.contains("status_code=\"429\"")
+                && line.contains("status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_request_duration_seconds_count{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("method=\"POST\"")
+                && line.contains("status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_request_errors_total{")
+                && line.contains("error_type=\"non_retryable_error\"")
+                && line.contains("status_code=\"429\"")
+                && line.contains("status_class=\"4xx\"")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_pd_requests_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("method=\"POST\"")
+                && line.contains("status_code=\"502\"")
+                && line.contains("status_class=\"5xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_pd_prefill_errors_total{")
+                && line.contains("worker=\"http://prefill1\"")
+                && line.contains("error_type=\"transport\"")
+                && line.contains("status_code=\"none\"")
+                && line.contains("status_class=\"none\"")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_embeddings_errors_total{")
+                && line.contains("status_code=\"429\"")
+                && line.contains("status_class=\"4xx\"")
+        }));
     }
 
     #[test]
