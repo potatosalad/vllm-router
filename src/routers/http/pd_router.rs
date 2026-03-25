@@ -651,7 +651,6 @@ impl PDRouter {
 
                             if !status.is_success() {
                                 error!("Prefill drain: error status={} url={}", status, url);
-                                RouterMetrics::record_pd_prefill_error(&url);
                             }
 
                             // Drain the response body efficiently
@@ -715,7 +714,6 @@ impl PDRouter {
     // Helper to handle server selection errors
     fn handle_server_selection_error(error: String) -> Response {
         error!("Failed to select PD pair error={}", error);
-        RouterMetrics::record_pd_error("server_selection");
         (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("No available servers: {}", error),
@@ -858,16 +856,18 @@ impl PDRouter {
         context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
-
         let route = context.route;
-        RetryExecutor::execute_response_with_retry(
+        let last_error_type = Arc::new(std::sync::Mutex::new(None::<&'static str>));
+        let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // Operation per attempt
             {
                 let original_request = original_request.clone();
+                let last_error_type = Arc::clone(&last_error_type);
                 move |attempt: u32| {
                     let original_request = original_request.clone();
                     let context = context.clone();
+                    let last_error_type = Arc::clone(&last_error_type);
                     async move {
                         // Select workers fresh for each attempt
                         let (prefill, decode) = match self
@@ -876,10 +876,12 @@ impl PDRouter {
                         {
                             Ok(pair) => pair,
                             Err(e) => {
-                                RouterMetrics::record_pd_error("server_selection");
+                                *last_error_type.lock().expect("pd error mutex poisoned") =
+                                    Some("server_selection");
                                 return Self::handle_server_selection_error(e);
                             }
                         };
+                        *last_error_type.lock().expect("pd error mutex poisoned") = None;
 
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
@@ -912,7 +914,6 @@ impl PDRouter {
                                 context,
                                 prefill.as_ref(),
                                 decode.as_ref(),
-                                start_time,
                             )
                             .await;
 
@@ -936,7 +937,20 @@ impl PDRouter {
             // On exhausted hook
             || RouterMetrics::record_retries_exhausted(route),
         )
-        .await
+        .await;
+
+        let status = response.status();
+        RouterMetrics::observe_pd_request(route, "POST", status, start_time.elapsed());
+
+        if let Some(error_type) = last_error_type
+            .lock()
+            .expect("pd error mutex poisoned")
+            .take()
+        {
+            RouterMetrics::record_pd_error(route, "POST", status, error_type);
+        }
+
+        response
     }
 
     async fn handle_decode_error_response(
@@ -998,7 +1012,6 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: &dyn Worker,
         decode: &dyn Worker,
-        start_time: Instant,
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
@@ -1060,13 +1073,6 @@ impl PDRouter {
                 tokio::join!(prefill_request.send(), decode_request.send());
             debug!("Received responses from both servers");
 
-            // Update metrics
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_request_duration(context.route, duration);
-            RouterMetrics::record_pd_request(context.route);
-            RouterMetrics::record_pd_prefill_request(prefill.url());
-            RouterMetrics::record_pd_decode_request(decode.url());
-
             // Process decode response with prefill for logprobs
             debug!("Processing decode response with logprobs");
             match decode_result {
@@ -1074,9 +1080,14 @@ impl PDRouter {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     debug!("Decode response status: {}", status);
+                    RouterMetrics::record_pd_decode_request(decode.url(), status);
 
                     if !status.is_success() {
-                        RouterMetrics::record_pd_decode_error(decode.url());
+                        RouterMetrics::record_pd_decode_error(
+                            decode.url(),
+                            "http_response",
+                            Some(status),
+                        );
                         error!(
                             "Decode server returned error status decode_url={} status={}",
                             decode.url(),
@@ -1140,7 +1151,7 @@ impl PDRouter {
                         error = %e,
                         "Decode request failed"
                     );
-                    RouterMetrics::record_pd_decode_error(decode.url());
+                    RouterMetrics::record_pd_decode_error(decode.url(), "transport", None);
                     (
                         StatusCode::BAD_GATEWAY,
                         format!("Decode server error: {}", e),
@@ -1176,35 +1187,67 @@ impl PDRouter {
             let drain_tx = self.prefill_drain_tx.clone();
             let prefill_url = prefill.url().to_string();
             tokio::spawn(async move {
-                if let Ok(response) = prefill_request.send().await {
-                    // Try to send to drain worker
-                    // If channel is full (under extreme load), drain inline as fallback
-                    match drain_tx.try_send(response) {
-                        Ok(_) => {
-                            // Successfully queued for draining
-                            debug!("Prefill response queued for draining");
+                match prefill_request.send().await {
+                    Ok(response) => {
+                        let status = StatusCode::from_u16(response.status().as_u16())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        RouterMetrics::record_pd_prefill_request(&prefill_url, status);
+                        if !status.is_success() {
+                            RouterMetrics::record_pd_prefill_error(
+                                &prefill_url,
+                                "http_response",
+                                Some(status),
+                            );
                         }
-                        Err(mpsc::error::TrySendError::Full(response)) => {
-                            // Channel full - drain inline as fallback
-                            warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
-                            RouterMetrics::record_pd_prefill_error(&prefill_url);
 
-                            // Drain inline with timeout to prevent blocking too long
-                            let drain_future = async {
-                                let mut stream = response.bytes_stream();
-                                while stream.next().await.is_some() {
-                                    // Just drain
+                        // Try to send to drain worker
+                        // If channel is full (under extreme load), drain inline as fallback
+                        match drain_tx.try_send(response) {
+                            Ok(_) => {
+                                // Successfully queued for draining
+                                debug!("Prefill response queued for draining");
+                            }
+                            Err(mpsc::error::TrySendError::Full(response)) => {
+                                // Channel full - drain inline as fallback
+                                warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
+                                RouterMetrics::record_pd_prefill_error(
+                                    &prefill_url,
+                                    "drain_queue_full",
+                                    Some(status),
+                                );
+
+                                // Drain inline with timeout to prevent blocking too long
+                                let drain_future = async {
+                                    let mut stream = response.bytes_stream();
+                                    while stream.next().await.is_some() {
+                                        // Just drain
+                                    }
+                                };
+
+                                match tokio::time::timeout(Duration::from_secs(1), drain_future)
+                                    .await
+                                {
+                                    Ok(_) => debug!("Inline drain completed for {}", prefill_url),
+                                    Err(_) => error!("Inline drain timeout for {}", prefill_url),
                                 }
-                            };
-
-                            match tokio::time::timeout(Duration::from_secs(1), drain_future).await {
-                                Ok(_) => debug!("Inline drain completed for {}", prefill_url),
-                                Err(_) => error!("Inline drain timeout for {}", prefill_url),
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                RouterMetrics::record_pd_prefill_error(
+                                    &prefill_url,
+                                    "drain_channel_closed",
+                                    Some(status),
+                                );
+                                error!("Prefill drain channel closed!");
                             }
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            error!("Prefill drain channel closed!");
-                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            prefill_url = %prefill_url,
+                            error = %e,
+                            "Prefill request failed"
+                        );
+                        RouterMetrics::record_pd_prefill_error(&prefill_url, "transport", None);
                     }
                 }
             });
@@ -1213,13 +1256,6 @@ impl PDRouter {
             let decode_result = decode_request.send().await;
             debug!("Received decode response");
 
-            // Update metrics
-            let duration = start_time.elapsed();
-            RouterMetrics::record_pd_request_duration(context.route, duration);
-            RouterMetrics::record_pd_request(context.route);
-            RouterMetrics::record_pd_prefill_request(prefill.url());
-            RouterMetrics::record_pd_decode_request(decode.url());
-
             // Process decode response immediately
             debug!("Processing decode response (no logprobs)");
             match decode_result {
@@ -1227,9 +1263,14 @@ impl PDRouter {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     debug!("Decode response status: {}", status);
+                    RouterMetrics::record_pd_decode_request(decode.url(), status);
 
                     if !status.is_success() {
-                        RouterMetrics::record_pd_decode_error(decode.url());
+                        RouterMetrics::record_pd_decode_error(
+                            decode.url(),
+                            "http_response",
+                            Some(status),
+                        );
                         error!(
                             "Decode server returned error status decode_url={} status={}",
                             decode.url(),
@@ -1269,6 +1310,11 @@ impl PDRouter {
                             }
                             Err(e) => {
                                 error!("Failed to read decode response: {}", e);
+                                RouterMetrics::record_pd_decode_error(
+                                    decode.url(),
+                                    "body_read",
+                                    Some(status),
+                                );
                                 (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
                                     .into_response()
                             }
@@ -1281,7 +1327,7 @@ impl PDRouter {
                         error = %e,
                         "Decode request failed"
                     );
-                    RouterMetrics::record_pd_decode_error(decode.url());
+                    RouterMetrics::record_pd_decode_error(decode.url(), "transport", None);
                     (
                         StatusCode::BAD_GATEWAY,
                         format!("Decode server error: {}", e),
@@ -1602,7 +1648,7 @@ impl PDRouter {
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
-                RouterMetrics::record_pd_prefill_error(prefill_url);
+                RouterMetrics::record_pd_prefill_error(prefill_url, "transport", None);
                 error!(
                     "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
                     prefill_url,
@@ -1623,10 +1669,15 @@ impl PDRouter {
 
         let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        RouterMetrics::record_pd_prefill_request(prefill_url, prefill_status);
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
-            RouterMetrics::record_pd_prefill_error(prefill_url);
+            RouterMetrics::record_pd_prefill_error(
+                prefill_url,
+                "http_response",
+                Some(prefill_status),
+            );
 
             // Get error body from prefill
             let error_msg = prefill_response

@@ -1,3 +1,4 @@
+use http::StatusCode;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -18,19 +19,47 @@ impl Default for PrometheusConfig {
     }
 }
 
+const DURATION_BUCKETS: [f64; 20] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0, 60.0,
+    90.0, 120.0, 180.0, 240.0,
+];
+
+const NO_STATUS_LABEL: &str = "none";
+
+fn status_code_label(status: StatusCode) -> String {
+    status.as_u16().to_string()
+}
+
+fn status_class_label(status: StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    }
+}
+
+fn optional_status_labels(status: Option<StatusCode>) -> (String, &'static str) {
+    status
+        .map(|status| (status_code_label(status), status_class_label(status)))
+        .unwrap_or_else(|| (NO_STATUS_LABEL.to_string(), NO_STATUS_LABEL))
+}
+
 pub fn init_metrics() {
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",
-        "Total number of requests by route and method"
+        "Total number of HTTP responses by route, method, and status"
     );
     describe_histogram!(
         "vllm_router_request_duration_seconds",
-        "Request duration in seconds by route"
+        "HTTP request duration in seconds by route, method, and status class"
     );
     describe_counter!(
         "vllm_router_request_errors_total",
-        "Total number of request errors by route and error type"
+        "Total number of structured request errors by route, method, error type, and status"
     );
     describe_counter!(
         "vllm_router_retries_total",
@@ -95,27 +124,27 @@ pub fn init_metrics() {
     // PD-specific metrics
     describe_counter!(
         "vllm_router_pd_requests_total",
-        "Total PD requests by route"
+        "Total number of PD HTTP responses by route, method, and status"
     );
     describe_counter!(
         "vllm_router_pd_prefill_requests_total",
-        "Total prefill requests per worker"
+        "Total number of prefill-stage HTTP responses by worker and status"
     );
     describe_counter!(
         "vllm_router_pd_decode_requests_total",
-        "Total decode requests per worker"
+        "Total number of decode-stage HTTP responses by worker and status"
     );
     describe_counter!(
         "vllm_router_pd_errors_total",
-        "Total PD errors by error type"
+        "Total number of structured PD errors by route, method, error type, and status"
     );
     describe_counter!(
         "vllm_router_pd_prefill_errors_total",
-        "Total prefill server errors"
+        "Total number of structured prefill-stage errors by worker, error type, and status"
     );
     describe_counter!(
         "vllm_router_pd_decode_errors_total",
-        "Total decode server errors"
+        "Total number of structured decode-stage errors by worker, error type, and status"
     );
     describe_counter!(
         "vllm_router_pd_stream_errors_total",
@@ -123,7 +152,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "vllm_router_pd_request_duration_seconds",
-        "PD request duration by route"
+        "PD request duration in seconds by route, method, and status class"
     );
 
     // Service discovery metrics
@@ -154,7 +183,7 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "vllm_router_embeddings_errors_total",
-        "Embedding request errors"
+        "Embedding request errors by HTTP status"
     );
     describe_gauge!("vllm_router_embeddings_queue_size", "Embedding queue size");
 
@@ -258,11 +287,6 @@ pub fn start_prometheus(config: PrometheusConfig) {
     init_metrics();
 
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
-    let duration_bucket = [
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
-        60.0, 90.0, 120.0, 180.0, 240.0,
-    ];
-
     let ip_addr: IpAddr = config
         .host
         .parse()
@@ -272,7 +296,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
     PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
-        .set_buckets_for_metric(duration_matcher, &duration_bucket)
+        .set_buckets_for_metric(duration_matcher, &DURATION_BUCKETS)
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
@@ -284,24 +308,33 @@ pub struct TokenizerMetrics;
 
 impl RouterMetrics {
     // Request metrics
-    pub fn record_request(route: &str) {
+    pub fn observe_request(route: &str, method: &str, status: StatusCode, duration: Duration) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!("vllm_router_requests_total",
-            "route" => route.to_string()
+            "route" => route.to_string(),
+            "method" => method.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
-    }
-
-    pub fn record_request_duration(route: &str, duration: Duration) {
         histogram!("vllm_router_request_duration_seconds",
-            "route" => route.to_string()
+            "route" => route.to_string(),
+            "method" => method.to_string(),
+            "status_class" => status_class.to_string()
         )
         .record(duration.as_secs_f64());
     }
 
-    pub fn record_request_error(route: &str, error_type: &str) {
+    pub fn record_request_error(route: &str, method: &str, status: StatusCode, error_type: &str) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!("vllm_router_request_errors_total",
             "route" => route.to_string(),
-            "error_type" => error_type.to_string()
+            "method" => method.to_string(),
+            "error_type" => error_type.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
@@ -387,51 +420,77 @@ impl RouterMetrics {
     }
 
     // PD-specific metrics
-    pub fn record_pd_request(route: &str) {
+    pub fn observe_pd_request(route: &str, method: &str, status: StatusCode, duration: Duration) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!("vllm_router_pd_requests_total",
-            "route" => route.to_string()
+            "route" => route.to_string(),
+            "method" => method.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
-    }
-
-    pub fn record_pd_request_duration(route: &str, duration: Duration) {
         histogram!("vllm_router_pd_request_duration_seconds",
-            "route" => route.to_string()
+            "route" => route.to_string(),
+            "method" => method.to_string(),
+            "status_class" => status_class.to_string()
         )
         .record(duration.as_secs_f64());
     }
 
-    pub fn record_pd_prefill_request(worker: &str) {
+    pub fn record_pd_prefill_request(worker: &str, status: StatusCode) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!("vllm_router_pd_prefill_requests_total",
-            "worker" => worker.to_string()
+            "worker" => worker.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
 
-    pub fn record_pd_decode_request(worker: &str) {
+    pub fn record_pd_decode_request(worker: &str, status: StatusCode) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!("vllm_router_pd_decode_requests_total",
-            "worker" => worker.to_string()
+            "worker" => worker.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
 
-    pub fn record_pd_error(error_type: &str) {
+    pub fn record_pd_error(route: &str, method: &str, status: StatusCode, error_type: &str) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!("vllm_router_pd_errors_total",
-            "error_type" => error_type.to_string()
+            "route" => route.to_string(),
+            "method" => method.to_string(),
+            "error_type" => error_type.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
 
-    pub fn record_pd_prefill_error(worker: &str) {
+    pub fn record_pd_prefill_error(worker: &str, error_type: &str, status: Option<StatusCode>) {
+        let (status_code, status_class) = optional_status_labels(status);
         counter!("vllm_router_pd_prefill_errors_total",
-            "worker" => worker.to_string()
+            "worker" => worker.to_string(),
+            "error_type" => error_type.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
 
-    pub fn record_pd_decode_error(worker: &str) {
+    pub fn record_pd_decode_error(worker: &str, error_type: &str, status: Option<StatusCode>) {
+        let (status_code, status_class) = optional_status_labels(status);
         counter!("vllm_router_pd_decode_errors_total",
-            "worker" => worker.to_string()
+            "worker" => worker.to_string(),
+            "error_type" => error_type.to_string(),
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
@@ -464,10 +523,13 @@ impl RouterMetrics {
         histogram!("vllm_router_embeddings_duration_seconds").record(duration.as_secs_f64());
     }
 
-    pub fn record_embeddings_error(error_type: &str) {
+    pub fn record_embeddings_error(status: StatusCode) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
         counter!(
             "vllm_router_embeddings_errors_total",
-            "error_type" => error_type.to_string()
+            "status_code" => status_code,
+            "status_class" => status_class.to_string()
         )
         .increment(1);
     }
@@ -857,9 +919,18 @@ mod tests {
     #[test]
     fn test_metrics_static_methods() {
         // Test that all static methods can be called without panic
-        RouterMetrics::record_request("/generate");
-        RouterMetrics::record_request_duration("/generate", Duration::from_millis(100));
-        RouterMetrics::record_request_error("/generate", "timeout");
+        RouterMetrics::observe_request(
+            "/generate",
+            "POST",
+            StatusCode::OK,
+            Duration::from_millis(100),
+        );
+        RouterMetrics::record_request_error(
+            "/generate",
+            "POST",
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout",
+        );
         RouterMetrics::record_retry("/generate");
 
         RouterMetrics::set_active_workers(5);
@@ -874,17 +945,31 @@ mod tests {
         RouterMetrics::record_load_balancing_event();
         RouterMetrics::set_load_range(20, 5);
 
-        RouterMetrics::record_pd_request("/v1/chat/completions");
-        RouterMetrics::record_pd_request_duration("/v1/chat/completions", Duration::from_secs(1));
-        RouterMetrics::record_pd_prefill_request("http://prefill1");
-        RouterMetrics::record_pd_decode_request("http://decode1");
-        RouterMetrics::record_pd_error("invalid_request");
-        RouterMetrics::record_pd_prefill_error("http://prefill1");
-        RouterMetrics::record_pd_decode_error("http://decode1");
+        RouterMetrics::observe_pd_request(
+            "/v1/chat/completions",
+            "POST",
+            StatusCode::BAD_GATEWAY,
+            Duration::from_secs(1),
+        );
+        RouterMetrics::record_pd_prefill_request("http://prefill1", StatusCode::OK);
+        RouterMetrics::record_pd_decode_request("http://decode1", StatusCode::BAD_GATEWAY);
+        RouterMetrics::record_pd_error(
+            "/v1/chat/completions",
+            "POST",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invalid_request",
+        );
+        RouterMetrics::record_pd_prefill_error("http://prefill1", "transport", None);
+        RouterMetrics::record_pd_decode_error(
+            "http://decode1",
+            "http_response",
+            Some(StatusCode::BAD_GATEWAY),
+        );
         RouterMetrics::record_pd_stream_error("http://decode1");
 
         RouterMetrics::record_discovery_update(3, 1);
         RouterMetrics::record_generate_duration(Duration::from_secs(2));
+        RouterMetrics::record_embeddings_error(StatusCode::TOO_MANY_REQUESTS);
         RouterMetrics::set_running_requests("http://worker1", 15);
     }
 
@@ -1002,7 +1087,7 @@ mod tests {
     #[test]
     fn test_empty_string_metrics() {
         // Test that empty strings don't cause issues
-        RouterMetrics::record_request("");
+        RouterMetrics::observe_request("", "GET", StatusCode::OK, Duration::from_millis(1));
         RouterMetrics::set_worker_health("", true);
         RouterMetrics::record_policy_decision("", "");
     }
@@ -1011,7 +1096,12 @@ mod tests {
     fn test_very_long_metric_labels() {
         let long_label = "a".repeat(1000);
 
-        RouterMetrics::record_request(&long_label);
+        RouterMetrics::observe_request(
+            &long_label,
+            "GET",
+            StatusCode::OK,
+            Duration::from_millis(1),
+        );
         RouterMetrics::set_worker_health(&long_label, false);
     }
 
@@ -1026,7 +1116,7 @@ mod tests {
         ];
 
         for label in special_labels {
-            RouterMetrics::record_request(label);
+            RouterMetrics::observe_request(label, "GET", StatusCode::OK, Duration::from_millis(1));
             RouterMetrics::set_worker_health(label, true);
         }
     }
@@ -1040,8 +1130,8 @@ mod tests {
         RouterMetrics::set_worker_load("worker", 0);
         RouterMetrics::set_worker_load("worker", usize::MAX);
 
-        RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
+        RouterMetrics::observe_request("route", "GET", StatusCode::OK, Duration::from_nanos(1));
         // 24 hours
-        RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
+        RouterMetrics::observe_request("route", "GET", StatusCode::OK, Duration::from_secs(86400));
     }
 }
