@@ -42,6 +42,27 @@ pub enum HealthStatus {
     Degraded,
 }
 
+/// Supported deterministic response modes for router integration tests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MockHttpResponseMode {
+    #[default]
+    Default,
+    Ok,
+    TooManyRequests,
+    ServiceUnavailable,
+}
+
+impl MockHttpResponseMode {
+    fn forced_http_status(self) -> Option<StatusCode> {
+        match self {
+            Self::Default => None,
+            Self::Ok => Some(StatusCode::OK),
+            Self::TooManyRequests => Some(StatusCode::TOO_MANY_REQUESTS),
+            Self::ServiceUnavailable => Some(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MockWorkerState {
     config: Arc<RwLock<MockWorkerConfig>>,
@@ -59,6 +80,13 @@ pub struct MockWorker {
 impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self::new_with_forced_http_status(config, None)
+    }
+
+    pub fn with_http_response_mode(
+        config: MockWorkerConfig,
+        response_mode: MockHttpResponseMode,
+    ) -> Self {
+        Self::new_with_forced_http_status(config, response_mode.forced_http_status())
     }
 
     pub fn with_forced_http_status(config: MockWorkerConfig, status: StatusCode) -> Self {
@@ -79,6 +107,16 @@ impl MockWorker {
 
     pub async fn set_forced_http_status(&self, status: Option<StatusCode>) {
         *self.forced_http_status.write().await = status;
+    }
+
+    pub async fn set_http_response_mode(&self, response_mode: MockHttpResponseMode) {
+        self.set_forced_http_status(response_mode.forced_http_status())
+            .await;
+    }
+
+    pub async fn clear_http_response_mode(&self) {
+        self.set_http_response_mode(MockHttpResponseMode::Default)
+            .await;
     }
 
     /// Start the mock worker server
@@ -1049,12 +1087,18 @@ mod tests {
 
     #[tokio::test]
     async fn forced_http_status_returns_deterministic_retryable_errors() {
-        for status in [
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::SERVICE_UNAVAILABLE,
+        for (response_mode, status) in [
+            (
+                MockHttpResponseMode::TooManyRequests,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                MockHttpResponseMode::ServiceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let mut worker =
-                MockWorker::with_forced_http_status(MockWorkerConfig::default(), status);
+                MockWorker::with_http_response_mode(MockWorkerConfig::default(), response_mode);
             let url = worker.start().await.expect("mock worker should start");
 
             let response = post_chat_completion(&url).await;
@@ -1072,12 +1116,12 @@ mod tests {
 
     #[tokio::test]
     async fn forced_http_status_ok_disables_random_failures() {
-        let mut worker = MockWorker::with_forced_http_status(
+        let mut worker = MockWorker::with_http_response_mode(
             MockWorkerConfig {
                 fail_rate: 1.0,
                 ..Default::default()
             },
-            StatusCode::OK,
+            MockHttpResponseMode::Ok,
         );
         let url = worker.start().await.expect("mock worker should start");
 
