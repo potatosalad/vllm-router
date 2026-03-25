@@ -145,6 +145,222 @@ async fn send_chat_completion_request(
     app.oneshot(request).await.unwrap()
 }
 
+fn prefill_decode_router_config_without_retries(
+    prefill_url: &str,
+    decode_url: &str,
+) -> RouterConfig {
+    let mut config = PdModeUnderTest::PrefillDecode.router_config(prefill_url, decode_url);
+    config.disable_retries = true;
+    config
+}
+
+async fn run_prefill_decode_http_status_metrics_single_attempt_test() {
+    let mut prefill_worker = MockWorker::with_http_response_mode(
+        MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        },
+        MockHttpResponseMode::Ok,
+    );
+    let prefill_url = prefill_worker
+        .start()
+        .await
+        .expect("failed to start prefill worker");
+
+    let mut decode_worker = MockWorker::with_http_response_mode(
+        MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        },
+        MockHttpResponseMode::Ok,
+    );
+    let decode_url = decode_worker
+        .start()
+        .await
+        .expect("failed to start decode worker");
+
+    let config = prefill_decode_router_config_without_retries(&prefill_url, &decode_url);
+    let app_context = common::create_test_context(config.clone());
+    let router = RouterFactory::create_router(&app_context)
+        .await
+        .unwrap_or_else(|error| panic!("failed to create PrefillDecode router: {error}"));
+    let app = create_test_app(Arc::from(router), reqwest::Client::new(), &config);
+
+    let recorder = build_test_recorder();
+    let handle = recorder.handle();
+    // Use a thread-local recorder so this binary never contends for the global recorder.
+    let _recorder_guard = set_default_local_recorder(&recorder);
+
+    let success_response = send_chat_completion_request(app.clone(), "successful decode").await;
+    assert_eq!(success_response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(success_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    decode_worker
+        .set_http_response_mode(MockHttpResponseMode::TooManyRequests)
+        .await;
+
+    let downstream_error_response =
+        send_chat_completion_request(app.clone(), "decode should return 429").await;
+    assert_eq!(
+        downstream_error_response.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let _ = axum::body::to_bytes(downstream_error_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let route = "route=\"/v1/chat/completions\"";
+    let method = "http_request_method=\"POST\"";
+    let prefill_worker_label = format!("worker=\"{prefill_url}\"");
+    let decode_worker_label = format!("worker=\"{decode_url}\"");
+
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_backend_http_responses_total{",
+        &[
+            route,
+            prefill_worker_label.as_str(),
+            "vllm_request_phase=\"prefill\"",
+            method,
+            "http_response_status_code=\"200\"",
+            "http_response_status_class=\"2xx\"",
+        ],
+        " 2",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_backend_http_response_duration_seconds_count{",
+        &[
+            route,
+            prefill_worker_label.as_str(),
+            "vllm_request_phase=\"prefill\"",
+            method,
+            "http_response_status_code=\"200\"",
+            "http_response_status_class=\"2xx\"",
+        ],
+        " 2",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_backend_http_responses_total{",
+        &[
+            route,
+            decode_worker_label.as_str(),
+            "vllm_request_phase=\"decode\"",
+            method,
+            "http_response_status_code=\"200\"",
+            "http_response_status_class=\"2xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_backend_http_response_duration_seconds_count{",
+        &[
+            route,
+            decode_worker_label.as_str(),
+            "vllm_request_phase=\"decode\"",
+            method,
+            "http_response_status_code=\"200\"",
+            "http_response_status_class=\"2xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_backend_http_responses_total{",
+        &[
+            route,
+            decode_worker_label.as_str(),
+            "vllm_request_phase=\"decode\"",
+            method,
+            "http_response_status_code=\"429\"",
+            "http_response_status_class=\"4xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_backend_http_response_duration_seconds_count{",
+        &[
+            route,
+            decode_worker_label.as_str(),
+            "vllm_request_phase=\"decode\"",
+            method,
+            "http_response_status_code=\"429\"",
+            "http_response_status_class=\"4xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_http_responses_total{",
+        &[
+            route,
+            method,
+            "http_response_status_code=\"200\"",
+            "http_response_status_class=\"2xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_http_response_duration_seconds_count{",
+        &[
+            route,
+            method,
+            "http_response_status_code=\"200\"",
+            "http_response_status_class=\"2xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_http_responses_total{",
+        &[
+            route,
+            method,
+            "http_response_status_code=\"429\"",
+            "http_response_status_class=\"4xx\"",
+        ],
+        " 1",
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
+        "vllm_router_http_response_duration_seconds_count{",
+        &[
+            route,
+            method,
+            "http_response_status_code=\"429\"",
+            "http_response_status_class=\"4xx\"",
+        ],
+        " 1",
+    )
+    .await;
+
+    decode_worker.clear_http_response_mode().await;
+    prefill_worker.clear_http_response_mode().await;
+    prefill_worker.stop().await;
+    decode_worker.stop().await;
+}
+
 async fn run_pd_http_status_metrics_test(mode: PdModeUnderTest) {
     let mut prefill_worker = MockWorker::new(MockWorkerConfig {
         port: 0,
@@ -324,6 +540,12 @@ async fn run_pd_http_status_metrics_test(mode: PdModeUnderTest) {
 #[tokio::test(flavor = "current_thread")]
 async fn test_pd_http_status_metrics_cover_prefill_decode_and_final_response() {
     run_pd_http_status_metrics_test(PdModeUnderTest::PrefillDecode).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_pd_http_status_metrics_cover_single_attempt_prefill_decode_backend_and_final_response(
+) {
+    run_prefill_decode_http_status_metrics_single_attempt_test().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
