@@ -423,13 +423,14 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
+        let start_time = Instant::now();
         let incoming_headers = req.headers();
         let headers = header_utils::copy_request_headers(&req);
+        let route_name = format!("/{}", endpoint);
 
-        match self.select_first_worker() {
+        let response = match self.select_first_worker() {
             Ok(worker_url) => {
                 let url = format!("{}/{}", worker_url, endpoint);
-                let route_name = format!("/{}", endpoint);
                 let mut request_builder = self.client.get(&url);
                 for (name, value) in headers {
                     let name_lc = name.to_lowercase();
@@ -441,6 +442,7 @@ impl Router {
                     }
                 }
 
+                let request_start = Instant::now();
                 match otel_http::send_client_request(
                     request_builder,
                     Some(incoming_headers),
@@ -456,6 +458,13 @@ impl Router {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        Self::observe_backend_response(
+                            &route_name,
+                            &worker_url,
+                            "GET",
+                            status,
+                            request_start.elapsed(),
+                        );
 
                         // Preserve headers from backend
                         let response_headers =
@@ -483,7 +492,9 @@ impl Router {
                 }
             }
             Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
-        }
+        };
+
+        Self::finish_regular_request(&route_name, "GET", start_time, response)
     }
 
     /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
@@ -2414,6 +2425,81 @@ mod tests {
         );
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_proxy_get_request_records_status_metrics_for_client_and_backend() {
+        let (worker_url, server_handle) =
+            start_status_sequence_server("/v1/models", vec![StatusCode::OK]).await;
+        let router = create_router_with_worker_urls(&[worker_url.clone()], RetryConfig::default());
+
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = set_default_local_recorder(&recorder);
+
+        let request = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.get_models(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let rendered = handle.render();
+        let route = "route=\"/v1/models\"";
+        let method = "http_request_method=\"GET\"";
+        let worker = format!("worker=\"{worker_url}\"");
+
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_responses_total{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_backend_http_response_duration_seconds_count{",
+            &[
+                route,
+                worker.as_str(),
+                "vllm_request_phase=\"inference\"",
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_responses_total{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+        assert_metric_line(
+            &rendered,
+            "vllm_router_http_response_duration_seconds_count{",
+            &[
+                route,
+                method,
+                "http_response_status_code=\"200\"",
+                "http_response_status_class=\"2xx\"",
+            ],
+            " 1",
+        );
+
+        server_handle.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
