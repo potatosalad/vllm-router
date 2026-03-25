@@ -5,7 +5,9 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use common::mock_worker::{
+    HealthStatus, MockHttpResponseMode, MockWorker, MockWorkerConfig, WorkerType,
+};
 use common::test_app::create_test_app;
 use metrics::set_default_local_recorder;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -121,7 +123,7 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
         .unwrap();
 
     decode_worker
-        .set_forced_http_status(Some(StatusCode::TOO_MANY_REQUESTS))
+        .set_http_response_mode(MockHttpResponseMode::TooManyRequests)
         .await;
 
     let downstream_error_response =
@@ -239,7 +241,7 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
         " 1",
     );
 
-    decode_worker.set_forced_http_status(None).await;
+    decode_worker.clear_http_response_mode().await;
     prefill_worker.stop().await;
     decode_worker.stop().await;
 }
