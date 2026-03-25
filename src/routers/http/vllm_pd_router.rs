@@ -20,7 +20,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -245,8 +245,28 @@ impl VllmPDRouter {
         start_time: Instant,
         response: Response,
     ) -> Response {
-        RouterMetrics::observe_pd_request(route, method, response.status(), start_time.elapsed());
+        let duration = start_time.elapsed();
+        RouterMetrics::observe_http_response(route, method, response.status(), duration);
+        RouterMetrics::observe_pd_request(route, method, response.status(), duration);
         response
+    }
+
+    fn observe_backend_response(
+        route: &str,
+        worker: &str,
+        request_phase: &str,
+        method: &str,
+        status: StatusCode,
+        duration: Duration,
+    ) {
+        RouterMetrics::observe_backend_http_response(
+            route,
+            worker,
+            request_phase,
+            method,
+            status,
+            duration,
+        );
     }
 
     /// Process vLLM request using pure service discovery
@@ -434,6 +454,7 @@ impl VllmPDRouter {
         }
 
         let prefill_request_url = format!("http://{}{}", prefill_base_http, path);
+        let prefill_request_start = Instant::now();
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.body(prefill_request_str),
             headers,
@@ -459,6 +480,14 @@ impl VllmPDRouter {
 
         let prefill_status = prefill_response.status();
         debug!("Prefill server responded with status: {}", prefill_status);
+        Self::observe_backend_response(
+            path,
+            prefill_http,
+            "prefill",
+            "POST",
+            prefill_status,
+            prefill_request_start.elapsed(),
+        );
         RouterMetrics::record_pd_prefill_request(prefill_http, prefill_status);
 
         if !prefill_status.is_success() {
@@ -562,6 +591,7 @@ impl VllmPDRouter {
         }
 
         let decode_request_url = format!("http://{}{}", decode_base_http, path);
+        let decode_request_start = Instant::now();
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.body(decode_request_str),
             headers,
@@ -590,6 +620,14 @@ impl VllmPDRouter {
             decode_response.status()
         );
         let decode_status = decode_response.status();
+        Self::observe_backend_response(
+            path,
+            decode_http,
+            "decode",
+            "POST",
+            decode_status,
+            decode_request_start.elapsed(),
+        );
         RouterMetrics::record_pd_decode_request(decode_http, decode_status);
 
         // Stop profiling on decode server after response received
@@ -778,6 +816,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
+        let prefill_request_start = Instant::now();
         let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -802,6 +841,14 @@ impl VllmPDRouter {
         };
 
         let prefill_status = prefill_response.status();
+        Self::observe_backend_response(
+            path,
+            &prefill_base_url,
+            "prefill",
+            "POST",
+            prefill_status,
+            prefill_request_start.elapsed(),
+        );
         RouterMetrics::record_pd_prefill_request(&prefill_base_url, prefill_status);
         debug!("📥 Prefill response status: {}", prefill_status);
         debug!(
@@ -944,6 +991,7 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
+        let decode_request_start = Instant::now();
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.json(&decode_request),
             headers,
@@ -974,6 +1022,14 @@ impl VllmPDRouter {
         decode_worker.decrement_load();
 
         let status = decode_response.status();
+        Self::observe_backend_response(
+            path,
+            &decode_base_url,
+            "decode",
+            "POST",
+            status,
+            decode_request_start.elapsed(),
+        );
         RouterMetrics::record_pd_decode_request(&decode_base_url, status);
         let headers = decode_response.headers().clone();
 
@@ -1874,7 +1930,106 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+    use metrics::with_local_recorder;
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use serde_json::json;
+    use std::time::Duration;
+
+    fn build_test_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+        PrometheusBuilder::new().build_recorder()
+    }
+
+    #[test]
+    fn test_finish_pd_request_emits_final_http_response_metrics_once() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            let response = VllmPDRouter::finish_pd_request(
+                "/v1/chat/completions",
+                "POST",
+                Instant::now(),
+                (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response(),
+            );
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_http_responses_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"429\"")
+                && line.contains("http_response_status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_http_response_duration_seconds_count{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"429\"")
+                && line.contains("http_response_status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+    }
+
+    #[test]
+    fn test_observe_backend_response_emits_phase_and_status_labels() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            VllmPDRouter::observe_backend_response(
+                "/v1/chat/completions",
+                "http://prefill1",
+                "prefill",
+                "POST",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Duration::from_millis(5),
+            );
+            VllmPDRouter::observe_backend_response(
+                "/v1/chat/completions",
+                "http://decode1",
+                "decode",
+                "POST",
+                StatusCode::TOO_MANY_REQUESTS,
+                Duration::from_millis(10),
+            );
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_backend_http_responses_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("worker=\"http://prefill1\"")
+                && line.contains("vllm_request_phase=\"prefill\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"503\"")
+                && line.contains("http_response_status_class=\"5xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_backend_http_responses_total{")
+                && line.contains("route=\"/v1/chat/completions\"")
+                && line.contains("worker=\"http://decode1\"")
+                && line.contains("vllm_request_phase=\"decode\"")
+                && line.contains("http_request_method=\"POST\"")
+                && line.contains("http_response_status_code=\"429\"")
+                && line.contains("http_response_status_class=\"4xx\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_backend_http_response_duration_seconds_count{")
+                && line.contains("worker=\"http://prefill1\"")
+                && line.contains("vllm_request_phase=\"prefill\"")
+                && line.contains("http_response_status_code=\"503\"")
+                && line.contains("http_response_status_class=\"5xx\"")
+                && line.ends_with(" 1")
+        }));
+    }
 
     // --- OpenAI-style endpoint tests (chat/completions, completions) ---
 
