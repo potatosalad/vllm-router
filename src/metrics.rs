@@ -108,11 +108,17 @@ pub fn init_metrics() {
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
-    describe_counter!("vllm_router_cache_hits_total", "Total cache hits");
-    describe_counter!("vllm_router_cache_misses_total", "Total cache misses");
+    describe_counter!(
+        "vllm_router_cache_hits_total",
+        "Cache-aware routing decisions that reused a worker above the cache threshold"
+    );
+    describe_counter!(
+        "vllm_router_cache_misses_total",
+        "Cache-aware routing decisions that fell back to low-affinity worker selection"
+    );
     describe_gauge!(
         "vllm_router_tree_size",
-        "Current tree size for cache-aware routing"
+        "Tracked cache-aware tree size per worker in characters"
     );
     describe_counter!(
         "vllm_router_load_balancing_events_total",
@@ -158,15 +164,15 @@ pub fn init_metrics() {
     // Service discovery metrics
     describe_counter!(
         "vllm_router_discovery_updates_total",
-        "Total service discovery update events"
+        "Total successful service discovery change events"
     );
     describe_gauge!(
         "vllm_router_discovery_workers_added",
-        "Number of workers added in last discovery update"
+        "Workers added in the most recent successful service discovery change"
     );
     describe_gauge!(
         "vllm_router_discovery_workers_removed",
-        "Number of workers removed in last discovery update"
+        "Workers removed in the most recent successful service discovery change"
     );
 
     // Generate request specific metrics
@@ -1062,6 +1068,32 @@ mod tests {
                 && line.contains("status_code=\"429\"")
                 && line.contains("status_class=\"4xx\"")
         }));
+    }
+
+    #[test]
+    fn test_rendered_metrics_include_cache_and_discovery_metrics() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            RouterMetrics::record_cache_hit();
+            RouterMetrics::record_cache_miss();
+            RouterMetrics::set_tree_size("http://worker1", 12);
+            RouterMetrics::record_discovery_update(1, 0);
+        });
+
+        let rendered = handle.render();
+
+        assert!(rendered.contains("vllm_router_cache_hits_total 1"));
+        assert!(rendered.contains("vllm_router_cache_misses_total 1"));
+        assert!(rendered.lines().any(|line| {
+            line.starts_with("vllm_router_tree_size{")
+                && line.contains("worker=\"http://worker1\"")
+                && line.ends_with(" 12")
+        }));
+        assert!(rendered.contains("vllm_router_discovery_updates_total 1"));
+        assert!(rendered.contains("vllm_router_discovery_workers_added 1"));
+        assert!(rendered.contains("vllm_router_discovery_workers_removed 0"));
     }
 
     #[test]
