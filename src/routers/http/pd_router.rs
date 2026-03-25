@@ -731,6 +731,36 @@ impl PDRouter {
             .into_response()
     }
 
+    fn finish_pd_request(
+        route: &str,
+        method: &str,
+        start_time: Instant,
+        response: Response,
+    ) -> Response {
+        let duration = start_time.elapsed();
+        RouterMetrics::observe_http_response(route, method, response.status(), duration);
+        RouterMetrics::observe_pd_request(route, method, response.status(), duration);
+        response
+    }
+
+    fn observe_backend_response(
+        route: &str,
+        worker: &str,
+        request_phase: &str,
+        method: &str,
+        status: StatusCode,
+        duration: Duration,
+    ) {
+        RouterMetrics::observe_backend_http_response(
+            route,
+            worker,
+            request_phase,
+            method,
+            status,
+            duration,
+        );
+    }
+
     // Helper to determine batch size from a GenerateRequest
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
         // Check prompt array
@@ -940,7 +970,6 @@ impl PDRouter {
         .await;
 
         let status = response.status();
-        RouterMetrics::observe_pd_request(route, "POST", status, start_time.elapsed());
 
         if let Some(error_type) = last_error_type
             .lock()
@@ -950,7 +979,7 @@ impl PDRouter {
             RouterMetrics::record_pd_error(route, "POST", status, error_type);
         }
 
-        response
+        Self::finish_pd_request(route, "POST", start_time, response)
     }
 
     async fn handle_decode_error_response(
@@ -1069,9 +1098,31 @@ impl PDRouter {
                 },
             );
             // When we need logprobs, wait for both responses
-            let (prefill_result, decode_result) =
-                tokio::join!(prefill_request.send(), decode_request.send());
+            let (prefill_result, decode_result) = tokio::join!(
+                async {
+                    let request_start = Instant::now();
+                    (prefill_request.send().await, request_start.elapsed())
+                },
+                async {
+                    let request_start = Instant::now();
+                    (decode_request.send().await, request_start.elapsed())
+                }
+            );
             debug!("Received responses from both servers");
+
+            let (prefill_result, prefill_duration) = prefill_result;
+            let (decode_result, decode_duration) = decode_result;
+
+            if let Ok(prefill_response) = prefill_result.as_ref() {
+                Self::observe_backend_response(
+                    context.route,
+                    prefill.url(),
+                    "prefill",
+                    "POST",
+                    prefill_response.status(),
+                    prefill_duration,
+                );
+            }
 
             // Process decode response with prefill for logprobs
             debug!("Processing decode response with logprobs");
@@ -1080,6 +1131,14 @@ impl PDRouter {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     debug!("Decode response status: {}", status);
+                    Self::observe_backend_response(
+                        context.route,
+                        decode.url(),
+                        "decode",
+                        "POST",
+                        status,
+                        decode_duration,
+                    );
                     RouterMetrics::record_pd_decode_request(decode.url(), status);
 
                     if !status.is_success() {
@@ -1186,11 +1245,21 @@ impl PDRouter {
             // This ensures HTTP compliance without blocking
             let drain_tx = self.prefill_drain_tx.clone();
             let prefill_url = prefill.url().to_string();
+            let route = context.route;
             tokio::spawn(async move {
+                let request_start = Instant::now();
                 match prefill_request.send().await {
                     Ok(response) => {
                         let status = StatusCode::from_u16(response.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        Self::observe_backend_response(
+                            route,
+                            &prefill_url,
+                            "prefill",
+                            "POST",
+                            status,
+                            request_start.elapsed(),
+                        );
                         RouterMetrics::record_pd_prefill_request(&prefill_url, status);
                         if !status.is_success() {
                             RouterMetrics::record_pd_prefill_error(
@@ -1253,6 +1322,7 @@ impl PDRouter {
             });
 
             // Wait only for decode response
+            let decode_request_start = Instant::now();
             let decode_result = decode_request.send().await;
             debug!("Received decode response");
 
@@ -1263,6 +1333,14 @@ impl PDRouter {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     debug!("Decode response status: {}", status);
+                    Self::observe_backend_response(
+                        context.route,
+                        decode.url(),
+                        "decode",
+                        "POST",
+                        status,
+                        decode_request_start.elapsed(),
+                    );
                     RouterMetrics::record_pd_decode_request(decode.url(), status);
 
                     if !status.is_success() {
