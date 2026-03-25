@@ -62,6 +62,22 @@ pub fn init_metrics() {
         "Total number of structured request errors by route, method, error type, and status"
     );
     describe_counter!(
+        "vllm_router_http_responses_total",
+        "Total number of client-visible HTTP responses by route, method, and status"
+    );
+    describe_histogram!(
+        "vllm_router_http_response_duration_seconds",
+        "Client-visible HTTP response duration in seconds by route, method, and status"
+    );
+    describe_counter!(
+        "vllm_router_backend_http_responses_total",
+        "Total number of downstream backend HTTP responses by route, worker, phase, method, and status"
+    );
+    describe_histogram!(
+        "vllm_router_backend_http_response_duration_seconds",
+        "Downstream backend HTTP response duration in seconds by route, worker, phase, method, and status"
+    );
+    describe_counter!(
         "vllm_router_retries_total",
         "Total number of request retries by route"
     );
@@ -237,6 +253,60 @@ impl RouterMetrics {
             "route" => route.to_string(),
             "method" => method.to_string(),
             "status_class" => status_class.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn observe_http_response(
+        route: &str,
+        method: &str,
+        status: StatusCode,
+        duration: Duration,
+    ) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
+        counter!("vllm_router_http_responses_total",
+            "route" => route.to_string(),
+            "http_request_method" => method.to_string(),
+            "http_response_status_code" => status_code.clone(),
+            "http_response_status_class" => status_class.to_string()
+        )
+        .increment(1);
+        histogram!("vllm_router_http_response_duration_seconds",
+            "route" => route.to_string(),
+            "http_request_method" => method.to_string(),
+            "http_response_status_code" => status_code,
+            "http_response_status_class" => status_class.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn observe_backend_http_response(
+        route: &str,
+        worker: &str,
+        request_phase: &str,
+        method: &str,
+        status: StatusCode,
+        duration: Duration,
+    ) {
+        let status_code = status_code_label(status);
+        let status_class = status_class_label(status);
+        counter!("vllm_router_backend_http_responses_total",
+            "route" => route.to_string(),
+            "worker" => worker.to_string(),
+            "vllm_request_phase" => request_phase.to_string(),
+            "http_request_method" => method.to_string(),
+            "http_response_status_code" => status_code.clone(),
+            "http_response_status_class" => status_class.to_string()
+        )
+        .increment(1);
+        histogram!("vllm_router_backend_http_response_duration_seconds",
+            "route" => route.to_string(),
+            "worker" => worker.to_string(),
+            "vllm_request_phase" => request_phase.to_string(),
+            "http_request_method" => method.to_string(),
+            "http_response_status_code" => status_code,
+            "http_response_status_class" => status_class.to_string()
         )
         .record(duration.as_secs_f64());
     }
