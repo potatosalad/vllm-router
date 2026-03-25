@@ -69,10 +69,19 @@ pub fn init_metrics() {
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",
-        "Total number of HTTP responses by route, method, and status"
+        "Total number of requests by route and method"
     );
     describe_histogram!(
         "vllm_router_request_duration_seconds",
+        "Request duration in seconds by route"
+    );
+    // HTTP middleware metrics (separate from legacy vllm_router_requests_total)
+    describe_counter!(
+        "vllm_router_http_requests_total",
+        "Total number of HTTP responses by route, method, and status"
+    );
+    describe_histogram!(
+        "vllm_router_http_request_duration_seconds",
         "HTTP request duration in seconds by route, method, and status class"
     );
     describe_counter!(
@@ -257,17 +266,17 @@ pub struct RouterMetrics;
 
 impl RouterMetrics {
     // Request metrics
-    pub fn observe_request(route: &str, method: &str, status: StatusCode, duration: Duration) {
+    pub fn observe_http_request(route: &str, method: &str, status: StatusCode, duration: Duration) {
         let status_code = status_code_label(status);
         let status_class = status_class_label(status);
-        counter!("vllm_router_requests_total",
+        counter!("vllm_router_http_requests_total",
             "route" => route.to_string(),
             "method" => method.to_string(),
             "status_code" => status_code,
             "status_class" => status_class.to_string()
         )
         .increment(1);
-        histogram!("vllm_router_request_duration_seconds",
+        histogram!("vllm_router_http_request_duration_seconds",
             "route" => route.to_string(),
             "method" => method.to_string(),
             "status_class" => status_class.to_string()
@@ -808,7 +817,7 @@ mod tests {
     #[test]
     fn test_metrics_static_methods() {
         // Test that all static methods can be called without panic
-        RouterMetrics::observe_request(
+        RouterMetrics::observe_http_request(
             "/generate",
             "POST",
             StatusCode::OK,
@@ -966,7 +975,7 @@ mod tests {
         let handle = recorder.handle();
 
         with_local_recorder(&recorder, || {
-            RouterMetrics::observe_request(
+            RouterMetrics::observe_http_request(
                 "/v1/chat/completions",
                 "POST",
                 StatusCode::TOO_MANY_REQUESTS,
@@ -998,7 +1007,7 @@ mod tests {
         let rendered = handle.render();
 
         assert!(rendered.lines().any(|line| {
-            line.starts_with("vllm_router_requests_total{")
+            line.starts_with("vllm_router_http_requests_total{")
                 && line.contains("route=\"/v1/chat/completions\"")
                 && line.contains("method=\"POST\"")
                 && line.contains("status_code=\"429\"")
@@ -1006,7 +1015,7 @@ mod tests {
                 && line.ends_with(" 1")
         }));
         assert!(rendered.lines().any(|line| {
-            line.starts_with("vllm_router_request_duration_seconds_count{")
+            line.starts_with("vllm_router_http_request_duration_seconds_count{")
                 && line.contains("route=\"/v1/chat/completions\"")
                 && line.contains("method=\"POST\"")
                 && line.contains("status_class=\"4xx\"")
@@ -1073,7 +1082,7 @@ mod tests {
 
         with_local_recorder(&recorder, || {
             RouterMetrics::set_active_workers(1);
-            RouterMetrics::observe_request(
+            RouterMetrics::observe_http_request(
                 "/generate",
                 "POST",
                 StatusCode::OK,
@@ -1161,7 +1170,7 @@ mod tests {
     #[test]
     fn test_empty_string_metrics() {
         // Test that empty strings don't cause issues
-        RouterMetrics::observe_request("", "GET", StatusCode::OK, Duration::from_millis(1));
+        RouterMetrics::observe_http_request("", "GET", StatusCode::OK, Duration::from_millis(1));
         RouterMetrics::set_worker_health("", true);
         RouterMetrics::record_policy_decision("", "");
     }
@@ -1170,7 +1179,7 @@ mod tests {
     fn test_very_long_metric_labels() {
         let long_label = "a".repeat(1000);
 
-        RouterMetrics::observe_request(
+        RouterMetrics::observe_http_request(
             &long_label,
             "GET",
             StatusCode::OK,
@@ -1190,7 +1199,7 @@ mod tests {
         ];
 
         for label in special_labels {
-            RouterMetrics::observe_request(label, "GET", StatusCode::OK, Duration::from_millis(1));
+            RouterMetrics::observe_http_request(label, "GET", StatusCode::OK, Duration::from_millis(1));
             RouterMetrics::set_worker_health(label, true);
         }
     }
@@ -1204,8 +1213,8 @@ mod tests {
         RouterMetrics::set_running_requests("worker", 0);
         RouterMetrics::set_running_requests("worker", usize::MAX);
 
-        RouterMetrics::observe_request("route", "GET", StatusCode::OK, Duration::from_nanos(1));
+        RouterMetrics::observe_http_request("route", "GET", StatusCode::OK, Duration::from_nanos(1));
         // 24 hours
-        RouterMetrics::observe_request("route", "GET", StatusCode::OK, Duration::from_secs(86400));
+        RouterMetrics::observe_http_request("route", "GET", StatusCode::OK, Duration::from_secs(86400));
     }
 }

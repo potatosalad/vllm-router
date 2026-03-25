@@ -230,7 +230,7 @@ pub async fn http_metrics_middleware(request: Request<axum::body::Body>, next: N
     let route = request_route_label(&request).to_string();
 
     let response = next.run(request).await;
-    RouterMetrics::observe_request(&route, &method, response.status(), start.elapsed());
+    RouterMetrics::observe_http_request(&route, &method, response.status(), start.elapsed());
     response
 }
 
@@ -650,7 +650,7 @@ mod tests {
         let rendered = handle.render();
         let request_line = rendered
             .lines()
-            .find(|line| line.starts_with("vllm_router_requests_total{"))
+            .find(|line| line.starts_with("vllm_router_http_requests_total{"))
             .expect("missing request counter output");
         assert!(
             request_line.contains("route=\"/widgets/{widget_id}\"")
@@ -663,7 +663,7 @@ mod tests {
 
         let duration_line = rendered
             .lines()
-            .find(|line| line.starts_with("vllm_router_request_duration_seconds_count{"))
+            .find(|line| line.starts_with("vllm_router_http_request_duration_seconds_count{"))
             .expect("missing request duration output");
         assert!(
             duration_line.contains("route=\"/widgets/{widget_id}\"")
