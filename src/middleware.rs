@@ -3,7 +3,6 @@ use axum::{
     middleware::Next, response::IntoResponse, response::Response,
 };
 use rand::Rng;
-use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,18 +216,18 @@ impl<B> OnRequest<B> for RequestLogger {
     }
 }
 
-fn request_route_label<B>(request: &Request<B>) -> Cow<'_, str> {
+fn request_route_label<B>(request: &Request<B>) -> &str {
     request
         .extensions()
         .get::<MatchedPath>()
-        .map(|route| Cow::Borrowed(route.as_str()))
-        .unwrap_or_else(|| Cow::Owned(request.uri().path().to_string()))
+        .map(|route| route.as_str())
+        .unwrap_or("unmatched")
 }
 
 pub async fn http_metrics_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
     let start = Instant::now();
     let method = request.method().to_string();
-    let route = request_route_label(&request).into_owned();
+    let route = request_route_label(&request).to_string();
 
     let response = next.run(request).await;
     RouterMetrics::observe_request(&route, &method, response.status(), start.elapsed());
