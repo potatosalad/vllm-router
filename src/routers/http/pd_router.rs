@@ -2460,123 +2460,144 @@ impl RouterTrait for PDRouter {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
-        // Only handle POST requests for inference
-        if *method != Method::POST {
-            return (
-                StatusCode::METHOD_NOT_ALLOWED,
-                "Only POST requests are supported for transparent proxy",
-            )
-                .into_response();
-        }
+        let start_time = Instant::now();
 
-        debug!(
-            "PDRouter transparent proxy: routing {} {} to decode worker",
-            method, path
-        );
-
-        // Get decode workers, filtered by availability
-        let all_decode_workers = self.worker_registry.get_decode_workers();
-        let decode_workers: Vec<Arc<dyn Worker>> = all_decode_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-
-        if decode_workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No decode workers available",
-            )
-                .into_response();
-        }
-
-        // Select a decode worker using policy with headers for consistent hash
-        let decode_policy = self.policy_registry.get_decode_policy();
-        let request_text = serde_json::to_string(&body).ok();
-        let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
-            h.iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
-                })
-                .collect()
-        });
-        let decode_idx = match decode_policy.select_worker_with_headers(
-            &decode_workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
-            Some(idx) => idx,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
+        let response = {
+            // Only handle POST requests for inference
+            if *method != Method::POST {
+                (
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "Only POST requests are supported for transparent proxy",
                 )
-                    .into_response();
+                    .into_response()
+            } else {
+                debug!(
+                    "PDRouter transparent proxy: routing {} {} to decode worker",
+                    method, path
+                );
+
+                // Get decode workers, filtered by availability
+                let all_decode_workers = self.worker_registry.get_decode_workers();
+                let decode_workers: Vec<Arc<dyn Worker>> = all_decode_workers
+                    .iter()
+                    .filter(|w| w.is_available())
+                    .cloned()
+                    .collect();
+
+                if decode_workers.is_empty() {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "No decode workers available",
+                    )
+                        .into_response()
+                } else {
+                    // Select a decode worker using policy with headers for consistent hash
+                    let decode_policy = self.policy_registry.get_decode_policy();
+                    let request_text = serde_json::to_string(&body).ok();
+                    let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+                        h.iter()
+                            .filter_map(|(name, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                            })
+                            .collect()
+                    });
+                    let decode_idx = match decode_policy.select_worker_with_headers(
+                        &decode_workers,
+                        request_text.as_deref(),
+                        request_headers.as_ref(),
+                    ) {
+                        Some(idx) => idx,
+                        None => {
+                            return Self::finish_pd_request(
+                                path,
+                                method.as_str(),
+                                start_time,
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "Decode policy failed to select a worker".to_string(),
+                                )
+                                    .into_response(),
+                            );
+                        }
+                    };
+
+                    let decode_worker = &decode_workers[decode_idx];
+                    let url = decode_worker.endpoint_url(path);
+
+                    debug!("PDRouter transparent proxy: forwarding to {}", url);
+
+                    // Build the request
+                    let mut request_builder = self.client.post(&url);
+
+                    // Add X-data-parallel-rank header for DP-aware routing
+                    request_builder =
+                        dp_utils::add_dp_rank_header(request_builder, decode_worker.dp_rank());
+
+                    // Add JSON body if not null
+                    if !body.is_null() {
+                        request_builder = request_builder.json(&body);
+                    }
+
+                    // Send request
+                    let request_start = Instant::now();
+                    match otel_http::send_client_request(
+                        request_builder,
+                        headers,
+                        ClientRequestOptions {
+                            method: "POST",
+                            url: &url,
+                            route: Some(path),
+                            request_phase: Some("inference"),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let status = StatusCode::from_u16(response.status().as_u16())
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                            Self::observe_backend_response(
+                                path,
+                                decode_worker.url(),
+                                "inference",
+                                method.as_str(),
+                                status,
+                                request_start.elapsed(),
+                            );
+                            let resp_headers = response.headers().clone();
+
+                            // Stream the response body
+                            let body = Body::from_stream(response.bytes_stream());
+                            let mut response_builder = Response::builder().status(status);
+
+                            for (name, value) in resp_headers.iter() {
+                                if name != "transfer-encoding" && name != "content-length" {
+                                    response_builder = response_builder.header(name, value);
+                                }
+                            }
+
+                            match response_builder.body(body) {
+                                Ok(response) => response,
+                                Err(e) => (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to build response: {}", e),
+                                )
+                                    .into_response(),
+                            }
+                        }
+                        Err(e) => (
+                            StatusCode::BAD_GATEWAY,
+                            format!("Backend request failed: {}", e),
+                        )
+                            .into_response(),
+                    }
+                }
             }
         };
 
-        let decode_worker = &decode_workers[decode_idx];
-        let url = decode_worker.endpoint_url(path);
-
-        debug!("PDRouter transparent proxy: forwarding to {}", url);
-
-        // Build the request
-        let mut request_builder = self.client.post(&url);
-
-        // Add X-data-parallel-rank header for DP-aware routing
-        request_builder = dp_utils::add_dp_rank_header(request_builder, decode_worker.dp_rank());
-
-        // Add JSON body if not null
-        if !body.is_null() {
-            request_builder = request_builder.json(&body);
-        }
-
-        // Send request
-        match otel_http::send_client_request(
-            request_builder,
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &url,
-                route: Some(path),
-                request_phase: Some("inference"),
-            },
-        )
-        .await
-        {
-            Ok(response) => {
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let resp_headers = response.headers().clone();
-
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
-                let mut response_builder = Response::builder().status(status);
-
-                for (name, value) in resp_headers.iter() {
-                    if name != "transfer-encoding" && name != "content-length" {
-                        response_builder = response_builder.header(name, value);
-                    }
-                }
-
-                match response_builder.body(body) {
-                    Ok(response) => response,
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build response: {}", e),
-                    )
-                        .into_response(),
-                }
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
-        }
+        Self::finish_pd_request(path, method.as_str(), start_time, response)
     }
 }
 

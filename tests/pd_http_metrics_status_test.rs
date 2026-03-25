@@ -10,9 +10,10 @@ use common::mock_worker::{
 };
 use common::test_app::create_test_app;
 use metrics::set_default_local_recorder;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::json;
 use std::sync::Arc;
+use tokio::time::{sleep, Duration, Instant};
 use tower::ServiceExt;
 use vllm_router_rs::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
@@ -23,34 +24,100 @@ fn build_test_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
     PrometheusBuilder::new().build_recorder()
 }
 
-fn vllm_pd_router_config(prefill_url: &str, decode_url: &str) -> RouterConfig {
-    RouterConfig {
-        mode: RoutingMode::VllmPrefillDecode {
-            prefill_urls: vec![(prefill_url.to_string(), None)],
-            decode_urls: vec![decode_url.to_string()],
-            prefill_policy: None,
-            decode_policy: None,
-            discovery_address: None,
-        },
-        policy: PolicyConfig::RoundRobin,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        request_timeout_secs: 10,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        ..Default::default()
+#[derive(Clone, Copy, Debug)]
+enum PdModeUnderTest {
+    PrefillDecode,
+    VllmPrefillDecode,
+}
+
+impl PdModeUnderTest {
+    fn router_config(self, prefill_url: &str, decode_url: &str) -> RouterConfig {
+        let mode = match self {
+            Self::PrefillDecode => RoutingMode::PrefillDecode {
+                prefill_urls: vec![(prefill_url.to_string(), None)],
+                decode_urls: vec![decode_url.to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            Self::VllmPrefillDecode => RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(prefill_url.to_string(), None)],
+                decode_urls: vec![decode_url.to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+        };
+
+        RouterConfig {
+            mode,
+            policy: PolicyConfig::RoundRobin,
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            request_timeout_secs: 10,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PrefillDecode => "PrefillDecode",
+            Self::VllmPrefillDecode => "VllmPrefillDecode",
+        }
+    }
+
+    fn prefill_success_count(self) -> usize {
+        match self {
+            Self::PrefillDecode => 6,
+            Self::VllmPrefillDecode => 2,
+        }
+    }
+
+    fn decode_error_count(self) -> usize {
+        match self {
+            Self::PrefillDecode => 5,
+            Self::VllmPrefillDecode => 1,
+        }
+    }
+}
+
+fn has_metric_line(rendered: &str, prefix: &str, fragments: &[&str], suffix: &str) -> bool {
+    rendered.lines().any(|line| {
+        line.starts_with(prefix)
+            && fragments.iter().all(|fragment| line.contains(fragment))
+            && line.ends_with(suffix)
+    })
 }
 
 fn assert_metric_line(rendered: &str, prefix: &str, fragments: &[&str], suffix: &str) {
     assert!(
-        rendered.lines().any(|line| {
-            line.starts_with(prefix)
-                && fragments.iter().all(|fragment| line.contains(fragment))
-                && line.ends_with(suffix)
-        }),
+        has_metric_line(rendered, prefix, fragments, suffix),
         "missing metric line: prefix={prefix}, fragments={fragments:?}, suffix={suffix}\n{rendered}"
     );
+}
+
+async fn assert_metric_line_eventually(
+    handle: &PrometheusHandle,
+    prefix: &str,
+    fragments: &[&str],
+    suffix: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut rendered = handle.render();
+
+    loop {
+        if has_metric_line(&rendered, prefix, fragments, suffix) {
+            return;
+        }
+
+        if Instant::now() >= deadline {
+            assert_metric_line(&rendered, prefix, fragments, suffix);
+        }
+
+        sleep(Duration::from_millis(10)).await;
+        rendered = handle.render();
+    }
 }
 
 async fn send_chat_completion_request(
@@ -78,8 +145,7 @@ async fn send_chat_completion_request(
     app.oneshot(request).await.unwrap()
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_response() {
+async fn run_pd_http_status_metrics_test(mode: PdModeUnderTest) {
     let mut prefill_worker = MockWorker::new(MockWorkerConfig {
         port: 0,
         worker_type: WorkerType::Prefill,
@@ -104,11 +170,11 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
         .await
         .expect("failed to start decode worker");
 
-    let config = vllm_pd_router_config(&prefill_url, &decode_url);
+    let config = mode.router_config(&prefill_url, &decode_url);
     let app_context = common::create_test_context(config.clone());
     let router = RouterFactory::create_router(&app_context)
         .await
-        .expect("failed to create vLLM PD router");
+        .unwrap_or_else(|error| panic!("failed to create {} router: {error}", mode.name()));
     let app = create_test_app(Arc::from(router), reqwest::Client::new(), &config);
 
     let recorder = build_test_recorder();
@@ -136,14 +202,15 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
         .await
         .unwrap();
 
-    let rendered = handle.render();
     let route = "route=\"/v1/chat/completions\"";
     let method = "http_request_method=\"POST\"";
     let prefill_worker_label = format!("worker=\"{prefill_url}\"");
     let decode_worker_label = format!("worker=\"{decode_url}\"");
+    let prefill_success_count = format!(" {}", mode.prefill_success_count());
+    let decode_error_count = format!(" {}", mode.decode_error_count());
 
-    assert_metric_line(
-        &rendered,
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_backend_http_responses_total{",
         &[
             route,
@@ -153,10 +220,11 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_code=\"200\"",
             "http_response_status_class=\"2xx\"",
         ],
-        " 2",
-    );
-    assert_metric_line(
-        &rendered,
+        prefill_success_count.as_str(),
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_backend_http_response_duration_seconds_count{",
         &[
             route,
@@ -166,10 +234,11 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_code=\"200\"",
             "http_response_status_class=\"2xx\"",
         ],
-        " 2",
-    );
-    assert_metric_line(
-        &rendered,
+        prefill_success_count.as_str(),
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_backend_http_responses_total{",
         &[
             route,
@@ -180,9 +249,10 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_class=\"2xx\"",
         ],
         " 1",
-    );
-    assert_metric_line(
-        &rendered,
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_backend_http_responses_total{",
         &[
             route,
@@ -192,10 +262,11 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_code=\"429\"",
             "http_response_status_class=\"4xx\"",
         ],
-        " 1",
-    );
-    assert_metric_line(
-        &rendered,
+        decode_error_count.as_str(),
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_backend_http_response_duration_seconds_count{",
         &[
             route,
@@ -205,10 +276,11 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_code=\"429\"",
             "http_response_status_class=\"4xx\"",
         ],
-        " 1",
-    );
-    assert_metric_line(
-        &rendered,
+        decode_error_count.as_str(),
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_http_responses_total{",
         &[
             route,
@@ -217,9 +289,10 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_class=\"2xx\"",
         ],
         " 1",
-    );
-    assert_metric_line(
-        &rendered,
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_http_responses_total{",
         &[
             route,
@@ -228,9 +301,10 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_class=\"4xx\"",
         ],
         " 1",
-    );
-    assert_metric_line(
-        &rendered,
+    )
+    .await;
+    assert_metric_line_eventually(
+        &handle,
         "vllm_router_http_response_duration_seconds_count{",
         &[
             route,
@@ -239,9 +313,20 @@ async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_respons
             "http_response_status_class=\"4xx\"",
         ],
         " 1",
-    );
+    )
+    .await;
 
     decode_worker.clear_http_response_mode().await;
     prefill_worker.stop().await;
     decode_worker.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_pd_http_status_metrics_cover_prefill_decode_and_final_response() {
+    run_pd_http_status_metrics_test(PdModeUnderTest::PrefillDecode).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_vllm_pd_http_status_metrics_cover_prefill_decode_and_final_response() {
+    run_pd_http_status_metrics_test(PdModeUnderTest::VllmPrefillDecode).await;
 }
