@@ -547,74 +547,89 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let last_error_type = Arc::new(std::sync::Mutex::new(None::<&'static str>));
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
-            |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+            {
+                let last_error_type = Arc::clone(&last_error_type);
+                move |_: u32| {
+                    let last_error_type = Arc::clone(&last_error_type);
+                    let text = text.clone();
+                    async move {
+                        let worker =
+                            match self.select_worker_for_model(model_id, Some(&text), headers) {
+                                Some(w) => w,
+                                None => {
+                                    *last_error_type
+                                        .lock()
+                                        .expect("request error mutex poisoned") =
+                                        Some("no_available_workers");
+                                    return (
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "No available workers (all circuits open or unhealthy)",
+                                    )
+                                        .into_response();
+                                }
+                            };
+                        *last_error_type
+                            .lock()
+                            .expect("request error mutex poisoned") = None;
 
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
+                        // Optional load tracking for cache-aware policy
+                        // Get the policy for this model to check if it's cache-aware
+                        let policy = match model_id {
+                            Some(model) => self.policy_registry.get_policy_or_default(model),
+                            None => self.policy_registry.get_default_policy(),
+                        };
 
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
+                        let load_incremented = if policy.name() == "cache_aware" {
+                            worker.increment_load();
+                            RouterMetrics::set_running_requests(worker.url(), worker.load());
+                            true
+                        } else {
+                            false
+                        };
 
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
+                        // Keep a clone for potential cleanup on retry
+                        let worker_for_cleanup = if load_incremented {
+                            Some(worker.clone())
+                        } else {
+                            None
+                        };
 
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                    )
-                    .await;
+                        let response = self
+                            .send_typed_request(
+                                headers,
+                                typed_req,
+                                route,
+                                worker.url(),
+                                is_stream,
+                                load_incremented,
+                            )
+                            .await;
 
-                // Client errors (4xx) are not worker failures - only server errors (5xx)
-                // should count against the circuit breaker. This matches pd_router.rs behavior.
-                let status = response.status();
-                worker.record_outcome(status.is_success() || status.is_client_error());
+                        // Client errors (4xx) are not worker failures - only server errors (5xx)
+                        // should count against the circuit breaker. This matches pd_router.rs behavior.
+                        let status = response.status();
+                        worker.record_outcome(status.is_success() || status.is_client_error());
 
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
+                        // For retryable failures, we need to decrement load since send_typed_request
+                        // won't have done it (it only decrements on success or non-retryable failures)
+                        if is_retryable_status(response.status()) && load_incremented {
+                            if let Some(cleanup_worker) = worker_for_cleanup {
+                                cleanup_worker.decrement_load();
+                                RouterMetrics::set_running_requests(
+                                    cleanup_worker.url(),
+                                    cleanup_worker.load(),
+                                );
+                            }
+                        }
+
+                        response
                     }
                 }
-
-                response
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -628,12 +643,17 @@ impl Router {
         )
         .await;
 
-        if response.status().is_success() {
-            let duration = start.elapsed();
-            RouterMetrics::record_request(route);
-            RouterMetrics::record_generate_duration(duration);
-        } else if !is_retryable_status(response.status()) {
-            RouterMetrics::record_request_error(route, "non_retryable_error");
+        let status = response.status();
+        if status.is_success() {
+            RouterMetrics::record_generate_duration(start.elapsed());
+        } else if let Some(error_type) = last_error_type
+            .lock()
+            .expect("request error mutex poisoned")
+            .take()
+        {
+            RouterMetrics::record_request_error(route, "POST", status, error_type);
+        } else if !is_retryable_status(status) {
+            RouterMetrics::record_request_error(route, "POST", status, "non_retryable_error");
         }
 
         response
@@ -1505,8 +1525,7 @@ impl RouterTrait for Router {
             RouterMetrics::record_embeddings_request();
             RouterMetrics::record_embeddings_duration(start.elapsed());
         } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_embeddings_error(&error_type);
+            RouterMetrics::record_embeddings_error(res.status());
         }
 
         res
