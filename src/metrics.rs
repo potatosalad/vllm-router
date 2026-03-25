@@ -25,6 +25,9 @@ const DURATION_BUCKETS: [f64; 20] = [
 ];
 
 const NO_STATUS_LABEL: &str = "none";
+const HTTP_REQUEST_METHOD_LABEL: &str = "http_request_method";
+const HTTP_RESPONSE_STATUS_CODE_LABEL: &str = "http_response_status_code";
+const HTTP_RESPONSE_STATUS_CLASS_LABEL: &str = "http_response_status_class";
 
 fn status_code_label(status: StatusCode) -> String {
     status.as_u16().to_string()
@@ -45,6 +48,21 @@ fn optional_status_labels(status: Option<StatusCode>) -> (String, &'static str) 
     status
         .map(|status| (status_code_label(status), status_class_label(status)))
         .unwrap_or_else(|| (NO_STATUS_LABEL.to_string(), NO_STATUS_LABEL))
+}
+
+fn http_response_status_code(status: StatusCode) -> String {
+    status_code_label(status)
+}
+
+fn http_response_status_class(status: StatusCode) -> &'static str {
+    status_class_label(status)
+}
+
+fn http_response_status_labels(status: StatusCode) -> (String, &'static str) {
+    (
+        http_response_status_code(status),
+        http_response_status_class(status),
+    )
 }
 
 pub fn init_metrics() {
@@ -263,20 +281,19 @@ impl RouterMetrics {
         status: StatusCode,
         duration: Duration,
     ) {
-        let status_code = status_code_label(status);
-        let status_class = status_class_label(status);
+        let (status_code, status_class) = http_response_status_labels(status);
         counter!("vllm_router_http_responses_total",
             "route" => route.to_string(),
-            "http_request_method" => method.to_string(),
-            "http_response_status_code" => status_code.clone(),
-            "http_response_status_class" => status_class.to_string()
+            HTTP_REQUEST_METHOD_LABEL => method.to_string(),
+            HTTP_RESPONSE_STATUS_CODE_LABEL => status_code.clone(),
+            HTTP_RESPONSE_STATUS_CLASS_LABEL => status_class.to_string()
         )
         .increment(1);
         histogram!("vllm_router_http_response_duration_seconds",
             "route" => route.to_string(),
-            "http_request_method" => method.to_string(),
-            "http_response_status_code" => status_code,
-            "http_response_status_class" => status_class.to_string()
+            HTTP_REQUEST_METHOD_LABEL => method.to_string(),
+            HTTP_RESPONSE_STATUS_CODE_LABEL => status_code,
+            HTTP_RESPONSE_STATUS_CLASS_LABEL => status_class.to_string()
         )
         .record(duration.as_secs_f64());
     }
@@ -289,24 +306,23 @@ impl RouterMetrics {
         status: StatusCode,
         duration: Duration,
     ) {
-        let status_code = status_code_label(status);
-        let status_class = status_class_label(status);
+        let (status_code, status_class) = http_response_status_labels(status);
         counter!("vllm_router_backend_http_responses_total",
             "route" => route.to_string(),
             "worker" => worker.to_string(),
             "vllm_request_phase" => request_phase.to_string(),
-            "http_request_method" => method.to_string(),
-            "http_response_status_code" => status_code.clone(),
-            "http_response_status_class" => status_class.to_string()
+            HTTP_REQUEST_METHOD_LABEL => method.to_string(),
+            HTTP_RESPONSE_STATUS_CODE_LABEL => status_code.clone(),
+            HTTP_RESPONSE_STATUS_CLASS_LABEL => status_class.to_string()
         )
         .increment(1);
         histogram!("vllm_router_backend_http_response_duration_seconds",
             "route" => route.to_string(),
             "worker" => worker.to_string(),
             "vllm_request_phase" => request_phase.to_string(),
-            "http_request_method" => method.to_string(),
-            "http_response_status_code" => status_code,
-            "http_response_status_class" => status_class.to_string()
+            HTTP_REQUEST_METHOD_LABEL => method.to_string(),
+            HTTP_RESPONSE_STATUS_CODE_LABEL => status_code,
+            HTTP_RESPONSE_STATUS_CLASS_LABEL => status_class.to_string()
         )
         .record(duration.as_secs_f64());
     }
@@ -798,6 +814,20 @@ mod tests {
             StatusCode::OK,
             Duration::from_millis(100),
         );
+        RouterMetrics::observe_http_response(
+            "/generate",
+            "POST",
+            StatusCode::OK,
+            Duration::from_millis(100),
+        );
+        RouterMetrics::observe_backend_http_response(
+            "/generate",
+            "http://worker1",
+            "inference",
+            "POST",
+            StatusCode::BAD_GATEWAY,
+            Duration::from_millis(75),
+        );
         RouterMetrics::record_request_error(
             "/generate",
             "POST",
@@ -843,6 +873,91 @@ mod tests {
         RouterMetrics::record_generate_duration(Duration::from_secs(2));
         RouterMetrics::record_embeddings_error(StatusCode::TOO_MANY_REQUESTS);
         RouterMetrics::set_running_requests("http://worker1", 15);
+    }
+
+    #[test]
+    fn test_http_response_status_helpers() {
+        assert_eq!(http_response_status_code(StatusCode::OK), "200");
+        assert_eq!(http_response_status_class(StatusCode::OK), "2xx");
+        assert_eq!(
+            http_response_status_labels(StatusCode::TOO_MANY_REQUESTS),
+            ("429".to_string(), "4xx")
+        );
+        assert_eq!(
+            http_response_status_labels(StatusCode::SERVICE_UNAVAILABLE),
+            ("503".to_string(), "5xx")
+        );
+    }
+
+    #[test]
+    fn test_rendered_metrics_include_status_aware_http_response_labels() {
+        let recorder = build_test_recorder();
+        let handle = recorder.handle();
+
+        with_local_recorder(&recorder, || {
+            RouterMetrics::observe_http_response(
+                "/generate",
+                "POST",
+                StatusCode::TOO_MANY_REQUESTS,
+                Duration::from_millis(25),
+            );
+            RouterMetrics::observe_backend_http_response(
+                "/generate",
+                "http://worker1",
+                "decode",
+                "POST",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Duration::from_millis(50),
+            );
+        });
+
+        let rendered = handle.render();
+
+        let http_response_counter = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_http_responses_total{"))
+            .expect("expected rendered final-response counter");
+        assert!(http_response_counter.contains("route=\"/generate\""));
+        assert!(http_response_counter.contains("http_request_method=\"POST\""));
+        assert!(http_response_counter.contains("http_response_status_code=\"429\""));
+        assert!(http_response_counter.contains("http_response_status_class=\"4xx\""));
+
+        let http_response_duration = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_http_response_duration_seconds_count{"))
+            .expect("expected rendered final-response duration histogram");
+        assert!(http_response_duration.contains("http_request_method=\"POST\""));
+        assert!(http_response_duration.contains("http_response_status_code=\"429\""));
+        assert!(http_response_duration.contains("http_response_status_class=\"4xx\""));
+        assert!(http_response_duration.ends_with(" 1"));
+
+        let backend_response_counter = rendered
+            .lines()
+            .find(|line| line.starts_with("vllm_router_backend_http_responses_total{"))
+            .expect("expected rendered backend-response counter");
+        assert!(backend_response_counter.contains("route=\"/generate\""));
+        assert!(backend_response_counter.contains("worker=\"http://worker1\""));
+        assert!(backend_response_counter.contains("vllm_request_phase=\"decode\""));
+        assert!(backend_response_counter.contains("http_request_method=\"POST\""));
+        assert!(backend_response_counter.contains("http_response_status_code=\"503\""));
+        assert!(backend_response_counter.contains("http_response_status_class=\"5xx\""));
+
+        let backend_response_duration = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("vllm_router_backend_http_response_duration_seconds_count{")
+            })
+            .expect("expected rendered backend-response duration histogram");
+        assert!(backend_response_duration.contains("worker=\"http://worker1\""));
+        assert!(backend_response_duration.contains("vllm_request_phase=\"decode\""));
+        assert!(backend_response_duration.contains("http_request_method=\"POST\""));
+        assert!(backend_response_duration.contains("http_response_status_code=\"503\""));
+        assert!(backend_response_duration.contains("http_response_status_class=\"5xx\""));
+        assert!(backend_response_duration.ends_with(" 1"));
+
+        assert!(!rendered.contains("http.request.method"));
+        assert!(!rendered.contains("http.response.status_code"));
+        assert!(!rendered.contains("http.response.status_class"));
     }
 
     #[test]
