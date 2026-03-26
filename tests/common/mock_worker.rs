@@ -1067,7 +1067,6 @@ pub fn clear_captured_requests(port: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
 
     async fn post_chat_completion(url: &str) -> reqwest::Response {
@@ -1089,16 +1088,18 @@ mod tests {
     async fn forced_http_status_returns_deterministic_retryable_errors() {
         for (response_mode, status) in [
             (
-                MockHttpResponseMode::TooManyRequests,
-                StatusCode::TOO_MANY_REQUESTS,
+                super::MockHttpResponseMode::TooManyRequests,
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
             ),
             (
-                MockHttpResponseMode::ServiceUnavailable,
-                StatusCode::SERVICE_UNAVAILABLE,
+                super::MockHttpResponseMode::ServiceUnavailable,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
             ),
         ] {
-            let mut worker =
-                MockWorker::with_http_response_mode(MockWorkerConfig::default(), response_mode);
+            let mut worker = super::MockWorker::with_http_response_mode(
+                super::MockWorkerConfig::default(),
+                response_mode,
+            );
             let url = worker.start().await.expect("mock worker should start");
 
             let response = post_chat_completion(&url).await;
@@ -1116,17 +1117,17 @@ mod tests {
 
     #[tokio::test]
     async fn forced_http_status_ok_disables_random_failures() {
-        let mut worker = MockWorker::with_http_response_mode(
-            MockWorkerConfig {
+        let mut worker = super::MockWorker::with_http_response_mode(
+            super::MockWorkerConfig {
                 fail_rate: 1.0,
                 ..Default::default()
             },
-            MockHttpResponseMode::Ok,
+            super::MockHttpResponseMode::Ok,
         );
         let url = worker.start().await.expect("mock worker should start");
 
         let response = post_chat_completion(&url).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let body: serde_json::Value = response
             .json()

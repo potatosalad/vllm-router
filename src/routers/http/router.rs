@@ -2431,7 +2431,10 @@ mod tests {
     async fn test_proxy_get_request_records_status_metrics_for_client_and_backend() {
         let (worker_url, server_handle) =
             start_status_sequence_server("/v1/models", vec![StatusCode::OK]).await;
-        let router = create_router_with_worker_urls(&[worker_url.clone()], RetryConfig::default());
+        let router = create_router_with_worker_urls(
+            std::slice::from_ref(&worker_url),
+            RetryConfig::default(),
+        );
 
         let recorder = build_test_recorder();
         let handle = recorder.handle();
@@ -2516,7 +2519,8 @@ mod tests {
             backoff_multiplier: 1.0,
             jitter_factor: 0.0,
         };
-        let router = create_router_with_worker_urls(&[worker_url.clone()], retry_config);
+        let router =
+            create_router_with_worker_urls(std::slice::from_ref(&worker_url), retry_config);
 
         let recorder = build_test_recorder();
         let handle = recorder.handle();
@@ -2626,7 +2630,10 @@ mod tests {
     async fn test_get_response_uses_normalized_route_label_for_status_metrics() {
         let (worker_url, server_handle) =
             start_status_sequence_server("/v1/responses/{response_id}", vec![StatusCode::OK]).await;
-        let router = create_router_with_worker_urls(&[worker_url.clone()], RetryConfig::default());
+        let router = create_router_with_worker_urls(
+            std::slice::from_ref(&worker_url),
+            RetryConfig::default(),
+        );
 
         let recorder = build_test_recorder();
         let handle = recorder.handle();
@@ -2679,7 +2686,10 @@ mod tests {
         let (worker_url, server_handle) =
             start_status_sequence_server("/v1/responses", vec![StatusCode::TOO_MANY_REQUESTS])
                 .await;
-        let router = create_router_with_worker_urls(&[worker_url.clone()], RetryConfig::default());
+        let router = create_router_with_worker_urls(
+            std::slice::from_ref(&worker_url),
+            RetryConfig::default(),
+        );
 
         let recorder = build_test_recorder();
         let handle = recorder.handle();
