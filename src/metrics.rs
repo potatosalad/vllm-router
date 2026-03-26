@@ -1199,7 +1199,12 @@ mod tests {
         ];
 
         for label in special_labels {
-            RouterMetrics::observe_http_request(label, "GET", StatusCode::OK, Duration::from_millis(1));
+            RouterMetrics::observe_http_request(
+                label,
+                "GET",
+                StatusCode::OK,
+                Duration::from_millis(1),
+            );
             RouterMetrics::set_worker_health(label, true);
         }
     }
@@ -1213,8 +1218,18 @@ mod tests {
         RouterMetrics::set_running_requests("worker", 0);
         RouterMetrics::set_running_requests("worker", usize::MAX);
 
-        RouterMetrics::observe_http_request("route", "GET", StatusCode::OK, Duration::from_nanos(1));
+        RouterMetrics::observe_http_request(
+            "route",
+            "GET",
+            StatusCode::OK,
+            Duration::from_nanos(1),
+        );
         // 24 hours
-        RouterMetrics::observe_http_request("route", "GET", StatusCode::OK, Duration::from_secs(86400));
+        RouterMetrics::observe_http_request(
+            "route",
+            "GET",
+            StatusCode::OK,
+            Duration::from_secs(86400),
+        );
     }
 }
